@@ -87,3 +87,34 @@ SPI工作在等待模式是一种可配置的低功耗模式。在这个模式�
 #### 停止模式(Stop Mode)
 
 为了降低功耗，SPI在停止模式是不活跃的。如果SPI配置为主机，正在进行的传输会停止，但是在CPU进入运行模式后会重新开始。如果SPI配置为从机，会继续接受和发送一个字节，这样就保证了从机与主机同步。
+
+## 本项目配置（SPI1 → 板载 BMI088）
+
+### 硬件连接
+
+| 信号 | 引脚 | 说明 |
+| --- | --- | --- |
+| SPI1_SCK | **PB3** | 复用 AF5；**不是**芯片默认的 PA5 |
+| SPI1_MISO | **PB4** | 复用 AF5；**不是**芯片默认的 PA6 |
+| SPI1_MOSI | **PA7** | 复用 AF5 |
+| CS_Accel | **PA4** | GPIO_Output，初始高（软件片选）|
+| CS_Gyro | **PB0** | GPIO_Output，初始高（软件片选）|
+
+### CubeMX 参数设置
+
+| 参数 | 取值 | 理由 |
+| --- | --- | --- |
+| Mode | Full-Duplex Master | 板上只有 MCU 一个主机 |
+| Hardware NSS Signal | **Disable（软件片选）** | BMI088 的加速度计与陀螺仪各有独立片选，硬件 NSS 只有一个 |
+| Data Size / First Bit | 8 Bits / MSB First | 数据手册要求 |
+| **CPOL / CPHA** | **High / 2 Edge = Mode 3** | BMI088 支持 Mode 0 与 Mode 3，本项目取 Mode 3 |
+| **Prescaler** | **/16 → 5.25 Mbit/s** | SPI1 挂 APB2 = 84MHz；BMI088 的 SCLK 上限为 10MHz |
+| CRC / TI Mode / NSS Pulse | 全部 Disabled | 不使用 |
+| DMA / 中断 | 均未开启 | 寄存器读写都是短传输，用阻塞式 `HAL_SPI_TransmitReceive` 足够 |
+
+### 本项目的几个注意点
+
+- **PB3/PB4 是 JTAG 引脚**（JTDO / NJTRST）。因此 `SYS → Debug` 必须选择 **Serial Wire**，否则这两个脚会被调试口占用，SPI1 出不来。
+- CubeMX 默认会把 SPI1 分配到 PA5/PA6/PA7，而本板实际走线是 PB3/PB4/PA7，所以 **SCK、MISO 需要手动改到 PB3/PB4**。
+- **片选空闲电平必须为高**：CS 低电平有效，若上电即为低，从设备会被误选中，与其他设备争用 MISO 线。
+- SPI 没有"读/写"之分：读寄存器同样要发送一个地址字节并同时收回一个字节，因此**读加速度计时需要丢弃返回的第一个无效字节**（对应 `modules/src/BMI088.cpp` 的实现）。
