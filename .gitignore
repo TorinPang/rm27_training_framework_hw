@@ -1,0 +1,62 @@
+# CMake build directories and generated files
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Makefile
+.ninja_deps
+.ninja_log
+.ninja/
+
+# C/C++ build artifacts
+*.o
+*.obj
+*.d
+*.su
+*.a
+*.lib
+*.so
+*.dll
+*.exp
+*.ilk
+
+# STM32 firmware and linker outputs
+*.elf
+*.axf
+*.bin
+*.hex
+*.map
+*.list
+*.lst
+*.srec
+*.out
+
+# Debugger and flashing tool files
+*.bak
+*.log
+*.launch
+*.jlink
+*.jdebug
+*.svd.bak
+
+# STM32CubeIDE / Eclipse local metadata
+.metadata/
+.settings/
+.project
+.cproject
+.mxproject
+
+# IDE and editor local files
+.vscode/*.log
+.vscode/*.tmp
+.idea/
+.solomd/
+.workbuddy/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
