@@ -29,7 +29,13 @@ project(${CMAKE_PROJECT_NAME})
 message("Build type: " ${CMAKE_BUILD_TYPE})
 
 # Enable CMake support for ASM and C languages
-enable_language(C ASM)
+enable_language(C ASM CXX)
+
+set(CMAKE_CXX_STANDARD 17)      # 新增：C++17
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 记一个变量：仓库根 = board/ 的上一级
+set(ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
@@ -50,6 +56,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
+    ${ROOT}/bsp/include
+    ${ROOT}/libs/include
+    ${ROOT}/modules/include
+    ${ROOT}/threads/include
 )
 
 # Add project symbols (macros)
