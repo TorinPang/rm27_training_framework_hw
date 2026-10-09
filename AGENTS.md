@@ -37,27 +37,52 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 
 ## 3. 当前状态
 
-### 3.1 已完成（2026-10-07）
+### 3.1 已完成
+
+**2026-10-07**
 
 - **CubeMX 配置全部完成并生成**，引脚映射见 §5。含 ThreadX（tick=1000、静态内存、时基已改 TIM3）。
 - 已实现：`libs/src/math.cpp`、`libs/src/crc.cpp`、`bsp/src/bsp_can.cpp` 的 `CAN_Init`、`modules/src/BMI088.cpp` 的 `Config()/Calibrate()`。
 - **`AGENTS.md` 即本文件**（README 第 4 步要求）。
 
+**2026-10-09 · 方向 A（USART 调试通道）代码完成，待上板验证**
+
+- `board/CMakeLists.txt`：`target_sources` 已接入 `bsp/src/bsp.cpp`、`bsp_usart.cpp`、`bsp_can.cpp`。
+  （`bsp_can.cpp` 必须一起进工程：`bsp_Init()` 会调 `CAN_Init()`，一旦 `bsp_Init` 被 `main` 引用，
+  整条引用链就"活"了，缺它则链接报 `undefined reference to CAN_Init()`。）
+- `bsp/src/bsp_usart.cpp`（TODO #3）：
+  - 接收用 `HAL_UARTEx_ReceiveToIdle_DMA`；本工程 RX DMA 是 **Circular**，IDLE 不会结束接收，故**只启动一次**，
+    回调里不再 arm，并关掉半传输中断避免半个缓冲区回调一次。
+  - 循环模式下回调的 `Size` 是**累计写入量**而非增量，故用 `usartX_rx_pos` 记录上次位置算增量，并处理缓冲回绕。
+  - `USART_Transmit` 按 mode 分派 BLOCK(超时 100ms)/IT/DMA；DMA 发送的缓冲区需在发送完成前保持有效。
+  - 预留弱符号 `USART_RxCallback(huart, pData, Size)` 作为上层数据出口（**暂未**写进 `bsp_usart.hpp`）。
+- 强符号 `extern "C" int __io_putchar(int ch)` → USART1：`printf` → `_write` → `__io_putchar` 链路打通。
+- `board/Core/Src/main.c`：USER CODE 2 中调用 `bsp_Init();`（在 `MX_ThreadX_Init()` 之前）。
+
+编译验证（`board/build/Debug`，Ninja + STM32CubeCLT）：**RAM 5528 B (4.22%) / FLASH 28560 B (2.72%)，无告警**。
+注意此刻 `printf` 整条链仍被 `--gc-sections` 丢弃（还没有代码调用 `printf`），所以 FLASH 未含 printf 代码，属正常。
+
 ### 3.2 待补 TODO（唯一权威清单）
 
-| # | 文件:行 | 内容 | 所属方向 |
-|---|---|---|---|
-| 1 | `libs/src/pid.cpp:22` | 位置式/增量式 + 积分限幅 `maxIOut` + 输出限幅 `maxOut` | 地基 |
-| 2 | `bsp/src/bsp_pwm.cpp:9,14,19,24,29` | PWM 初始化/启停/周期(秒→ARR)/占空比([0,1]→CCR) | B·C |
-| 3 | `bsp/src/bsp_usart.cpp:11,16,21,30` | 双串口 DMA+空闲中断、启动接收、按 mode 发送 | A |
-| 4 | `bsp/src/bsp_can.cpp:44,50` | `CAN_Transmit` 组帧发送；接收回调按总线+标准帧 ID 分发 | B |
-| 5 | `modules/include/BMI088.hpp:21` | SPI 句柄 + ACC/GYRO 片选宏 | C |
-| 6 | `modules/src/BMI088.cpp:63,106,111,116,126,208,215,222` | 温控占空比、数据校验、寄存器读写、三轴/温度解析 | C |
-| 7 | `modules/src/M2006.cpp:5,11,12,18` | 构造参数、松开/速度/位置双环、`maxCurrent` 限幅、`AliveCheck` | B |
-| 8 | `modules/include/DJIMotor.hpp:65,66` | 速度环/位置环 PID 参数 | B |
-| 9 | `modules/src/DJIMotorHandler.cpp:5,6,14,15,20,28,29,36` | 注册(0x201~0x208)、0x200/0x1FF 存在标志、组帧大端序、反馈解析+编码器回绕+减速比换算、存活检查 | B |
-| 10 | `threads/*`（空） | alive / imu / control 三个线程 + `main.c` 创建 | A~E |
-| 11 | LED 模块 | 自行封装 GPIO（`bsp/` 下新增），供 alive 线程做灯效 | E |
+| # | 文件:行 | 内容 | 所属方向 | 状态 |
+|---|---|---|---|---|
+| 1 | `libs/src/pid.cpp:22` | 位置式/增量式 + 积分限幅 `maxIOut` + 输出限幅 `maxOut` | 地基 | 待做 |
+| 2 | `bsp/src/bsp_pwm.cpp:9,14,19,24,29` | PWM 初始化/启停/周期(秒→ARR)/占空比([0,1]→CCR) | B·C | 待做 |
+| 3 | `bsp/src/bsp_usart.cpp` | 双串口 DMA+空闲中断、启动接收、按 mode 发送 | A | **代码完成，待上板验证** |
+| 4 | `bsp/src/bsp_can.cpp:44,50` | `CAN_Transmit` 组帧发送；接收回调按总线+标准帧 ID 分发 | B | 待做 |
+| 5 | `modules/include/BMI088.hpp:21` | SPI 句柄 + ACC/GYRO 片选宏 | C | 待做 |
+| 6 | `modules/src/BMI088.cpp:63,106,111,116,126,208,215,222` | 温控占空比、数据校验、寄存器读写、三轴/温度解析 | C | 待做 |
+| 7 | `modules/src/M2006.cpp:5,11,12,18` | 构造参数、松开/速度/位置双环、`maxCurrent` 限幅、`AliveCheck` | B | 待做 |
+| 8 | `modules/include/DJIMotor.hpp:65,66` | 速度环/位置环 PID 参数 | B | 待做 |
+| 9 | `modules/src/DJIMotorHandler.cpp:5,6,14,15,20,28,29,36` | 注册(0x201~0x208)、0x200/0x1FF 存在标志、组帧大端序、反馈解析+编码器回绕+减速比换算、存活检查 | B | 待做 |
+| 10 | `threads/*`（空） | alive / imu / control 三个线程 + `main.c` 创建 | A~E | 待做 |
+| 11 | LED 模块 | 自行封装 GPIO（`bsp/` 下新增），供 alive 线程做灯效 | E | 待做 |
+
+### 3.3 待上板验证清单（缺硬件期间只累积，有板后一次性跑完）
+
+- [ ] A · USART1 打印：串口助手连 PA9/PB7、**115200 / 8N1**，能看到 `printf` 输出
+- [ ] A · USART6 收发：与裁判系统口一致（PG14/PG9）
+- [ ] A · USART 接收链路：发数据触发 `USART_RxCallback`（临时做回环：收什么回什么），验证增量+回绕算法
 
 ---
 
@@ -76,12 +101,29 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 
 **验收**：能编译、能下载、能点灯（LED 最简单，先证明工具链通）。
 
+**实际执行修正（2026-10-09）**：地基的"一次性"只做了**真正横向**的部分 ——
+`enable_language(C ASM CXX)`、C++17 标准、四层 `include/` 路径。
+`target_sources` 改为**按方向渐进加入**（目前只有 `bsp/bsp.cpp`、`bsp/bsp_usart.cpp`、`bsp/bsp_can.cpp`），
+理由：四层 `.cpp` 里大量是未填的 TODO 桩，一次全加等于把"某个小步"变成"四层能不能编译过"的大验证，
+一旦报错还得逐个排查归属，反而慢。规则：**谁被当前方向的调用链引用，谁才进 `target_sources`**
+（`--gc-sections` 保证未引用的函数不占空间；反过来，一旦某函数被调用，它引用的整条链都必须补齐，否则链接失败）。
+另：显式列文件名，**不用 `file(GLOB)`**，避免新增文件后 CMake 不重配导致"文件加了却编不进去"。
+
 ### 4.2 方向 A · USART 调试通道（最先做，回报最高）
 
 配置（已完成，DMA 已就位）→ 封装 `bsp_usart.cpp`（TODO #3）→ 上板验证 `printf`。
 
 **验收**：串口助手能看到打印；115200、8N1。后续所有方向的验证都靠它。
 实现建议：接收用 `HAL_UARTEx_ReceiveToIdle_DMA`（HAL 内部处理 IDLE）+ `HAL_UARTEx_RxEventCallback` 回调；发送 DMA 的 buffer 必须是 static/全局。
+
+**进度（2026-10-09）**：配置、`bsp_usart.cpp`（TODO #3）、`__io_putchar` 重定向、`main.c` 调 `bsp_Init()`
+**均已代码完成并编译通过**；**只剩上板验收**，因暂时没有硬件而挂起（详见 §3.3）。
+
+**拿到板子后照做**：
+1. 串口助手连 USART1（PA9=TX / PB7=RX），**115200 / 8N1**；
+2. 在 `main.c` 的 USER CODE 2、`bsp_Init();` 之后加一句 `printf("boot ok\r\n");`，重新编译下载 —— 看到打印即通过；
+3. 再做接收链路验证：临时实现强符号 `USART_RxCallback`（收什么回什么），验证"增量 + 缓冲回绕"算法；
+4. 现象、猜想、改动、结果记入 `docs/logs.md`。
 
 ### 4.3 方向 B · CAN → 电机（保底分，越早跑通越好）
 

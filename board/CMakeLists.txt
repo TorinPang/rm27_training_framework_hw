@@ -51,6 +51,9 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
+    ${ROOT}/bsp/src/bsp.cpp
+    ${ROOT}/bsp/src/bsp_usart.cpp
+    ${ROOT}/bsp/src/bsp_can.cpp
 )
 
 # Add include paths
