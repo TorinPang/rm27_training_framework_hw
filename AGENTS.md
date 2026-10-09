@@ -62,11 +62,26 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 编译验证（`board/build/Debug`，Ninja + STM32CubeCLT）：**RAM 5528 B (4.22%) / FLASH 28560 B (2.72%)，无告警**。
 注意此刻 `printf` 整条链仍被 `--gc-sections` 丢弃（还没有代码调用 `printf`），所以 FLASH 未含 printf 代码，属正常。
 
+**2026-10-09 · 地基 TODO #1（PID）**
+
+- `libs/src/pid.cpp`（TODO #1）实现完成：
+  - 位置式：`u = kp·e0 + Σ(ki·e0) + kd·(e0-e1)`，积分项**先用自己的累加值经 `maxIOut` 限幅再求和**（抗积分饱和）；
+  - 增量式：`Δu = kp·(e0-e1) + ki·e0 + kd·(e0-2e1+e2)`，`result` 自身累加、由 `maxOut` 限幅
+    （增量式没有独立积分累加器，积分作用体现在 `result` 的累加里，故不用 `maxIOut`）；
+  - 末端统一按 `maxOut` 限幅；`result` 出现 NaN/Inf 时 `Clear()` 归零后返回（输出 0，安全侧）。
+- `board/CMakeLists.txt`：`target_sources` 加 `libs/src/math.cpp`（`Numeric::LimitABS` 的定义处，pid.cpp 依赖它）
+  与 `libs/src/pid.cpp`。
+- 验证：① 增量编译通过（`exit=0`，FLASH 仍 28560 B —— PID/math 尚未被任何代码调用，被 `--gc-sections` 丢弃属正常）；
+  ② 本机无 host 编译器，故用 Python 复现同一递推式做数值交叉验证：P/I/D 三项、积分限幅、输出限幅、
+  增量累加、NaN 保护、一阶对象闭环收敛（2000 拍收敛到目标），并把"误差符号写反"的对照组跑出发散作为判别性检查 —— 全部通过。
+  该脚本是**算法层验证，非执行 C++ 代码**，留档需要可随时搬进仓库。
+- 提示：`DJIMotor.hpp:65,66` 的 PID 参数目前全 0（含 `maxOut=0`）→ 电机输出恒 0，正好是 TODO 未填时的安全默认。
+
 ### 3.2 待补 TODO（唯一权威清单）
 
 | # | 文件:行 | 内容 | 所属方向 | 状态 |
 |---|---|---|---|---|
-| 1 | `libs/src/pid.cpp:22` | 位置式/增量式 + 积分限幅 `maxIOut` + 输出限幅 `maxOut` | 地基 | 待做 |
+| 1 | `libs/src/pid.cpp` | 位置式/增量式 + 积分限幅 `maxIOut` + 输出限幅 `maxOut` | 地基 | **代码完成**（编译 + 数值验证；纯算法，无需上板） |
 | 2 | `bsp/src/bsp_pwm.cpp:9,14,19,24,29` | PWM 初始化/启停/周期(秒→ARR)/占空比([0,1]→CCR) | B·C | 待做 |
 | 3 | `bsp/src/bsp_usart.cpp` | 双串口 DMA+空闲中断、启动接收、按 mode 发送 | A | **代码完成，待上板验证** |
 | 4 | `bsp/src/bsp_can.cpp:44,50` | `CAN_Transmit` 组帧发送；接收回调按总线+标准帧 ID 分发 | B | 待做 |
@@ -100,6 +115,9 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 3. 保证 `cmake --build` 通过（此时功能都没接线，编译过即可）。
 
 **验收**：能编译、能下载、能点灯（LED 最简单，先证明工具链通）。
+
+**进度（2026-10-09）**：① 已做（`enable_language(C ASM CXX)` + C++17 + 四层 `include/`）；② 已做（`libs/src/pid.cpp`，见 §3.1）；
+③ `cmake --build` 通过。**验收里"能下载、能点灯"仍缺硬件，挂起**（点灯还需先有 TODO #11 的 LED 模块）。
 
 **实际执行修正（2026-10-09）**：地基的"一次性"只做了**真正横向**的部分 ——
 `enable_language(C ASM CXX)`、C++17 标准、四层 `include/` 路径。

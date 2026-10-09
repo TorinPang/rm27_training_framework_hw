@@ -54,6 +54,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${ROOT}/bsp/src/bsp.cpp
     ${ROOT}/bsp/src/bsp_usart.cpp
     ${ROOT}/bsp/src/bsp_can.cpp
+    ${ROOT}/libs/src/math.cpp
+    ${ROOT}/libs/src/pid.cpp
 )
 
 # Add include paths
