@@ -77,6 +77,19 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
   该脚本是**算法层验证，非执行 C++ 代码**，留档需要可随时搬进仓库。
 - 提示：`DJIMotor.hpp:65,66` 的 PID 参数目前全 0（含 `maxOut=0`）→ 电机输出恒 0，正好是 TODO 未填时的安全默认。
 
+**2026-10-10 · 方向 B 步骤 1（`bsp_can`，TODO #4）代码完成，待上板验证**
+
+- `bsp/src/bsp_can.cpp`（TODO #4）实现完成：
+  - `CAN_Transmit`：参数保护（句柄 / 数据 / `len<=8`）+ 标准帧 ID 校验（`<=0x7FF`）+ 邮箱满即返回，
+    填 `CAN_TxHeaderTypeDef`（`IDE=CAN_ID_STD`、`RTR=CAN_RTR_DATA`、`DLC=len`）后调 `HAL_CAN_AddTxMessage`。
+  - 接收：强符号实现 `extern "C" HAL_CAN_RxFifo0MsgPendingCallback`（只取数据帧里的标准帧），
+    再经**弱符号 `CAN_RxCallback(hcan, StdId, data)`** 上交 —— 与 `USART_RxCallback` 同一约定，
+    让 `bsp/` 不反向 include `modules/`（守住 §2 分层）。**ID→电机 index 的映射留给上层 `DJIMotorHandler`（B 步骤 2）**。
+  - 弱符号此处给的是**空实现**（非 USART 那样的裸声明）：万一上层还没提供强符号，调用落到空函数而非地址 0。
+- 编译验证：`exit=0`、**无告警**；RAM 5528 B 不变、FLASH 28560 → **29244 B (+684)**
+  （新回调被 `HAL_CAN_IRQHandler` 引用而保留；`CAN_Transmit` 暂无人调用、被 `--gc-sections` 丢弃）。
+- 未做（B 后续）：`DJIMotorHandler`（步骤 2）→ `M2006` + `DJIMotor.hpp` 参数（步骤 3）→ `control` 线程（步骤 4）。
+
 ### 3.2 待补 TODO（唯一权威清单）
 
 | # | 文件:行 | 内容 | 所属方向 | 状态 |
@@ -84,7 +97,7 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 | 1 | `libs/src/pid.cpp` | 位置式/增量式 + 积分限幅 `maxIOut` + 输出限幅 `maxOut` | 地基 | **代码完成**（编译 + 数值验证；纯算法，无需上板） |
 | 2 | `bsp/src/bsp_pwm.cpp:9,14,19,24,29` | PWM 初始化/启停/周期(秒→ARR)/占空比([0,1]→CCR) | B·C | 待做 |
 | 3 | `bsp/src/bsp_usart.cpp` | 双串口 DMA+空闲中断、启动接收、按 mode 发送 | A | **代码完成，待上板验证** |
-| 4 | `bsp/src/bsp_can.cpp:44,50` | `CAN_Transmit` 组帧发送；接收回调按总线+标准帧 ID 分发 | B | 待做 |
+| 4 | `bsp/src/bsp_can.cpp` | `CAN_Transmit` 组帧发送；接收回调取帧并上交上层（弱符号 `CAN_RxCallback`） | B | **代码完成，待上板验证** |
 | 5 | `modules/include/BMI088.hpp:21` | SPI 句柄 + ACC/GYRO 片选宏 | C | 待做 |
 | 6 | `modules/src/BMI088.cpp:63,106,111,116,126,208,215,222` | 温控占空比、数据校验、寄存器读写、三轴/温度解析 | C | 待做 |
 | 7 | `modules/src/M2006.cpp:5,11,12,18` | 构造参数、松开/速度/位置双环、`maxCurrent` 限幅、`AliveCheck` | B | 待做 |
@@ -98,6 +111,8 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - [ ] A · USART1 打印：串口助手连 PA9/PB7、**115200 / 8N1**，能看到 `printf` 输出
 - [ ] A · USART6 收发：与裁判系统口一致（PG14/PG9）
 - [ ] A · USART 接收链路：发数据触发 `USART_RxCallback`（临时做回环：收什么回什么），验证增量+回绕算法
+- [ ] B · CAN 发送：RELAX 模式下用 CAN 分析仪确认 0x200/0x1FF 报文 ID 与 8 字节大端序，电流为 0
+- [ ] B · CAN 接收：电机上电后能收到 0x201~0x208 反馈，`CAN_RxCallback` 被触发（先用打印肉眼确认）
 
 ---
 

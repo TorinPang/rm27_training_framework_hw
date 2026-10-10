@@ -34,17 +34,70 @@ void CAN_Init(void)
 
 void CAN_Transmit(CAN_HandleTypeDef *hcan, uint32_t Id, uint8_t *msg, uint16_t len)
 {
-    if (HAL_CAN_GetTxMailboxesFreeLevel(hcan) == 0)
+    CAN_TxHeaderTypeDef tx_header;
+    uint32_t mailbox;
+
+    // 参数保护：句柄、数据、长度（标准帧数据长度 0~8）都要合法
+    if ((hcan == NULL) || (msg == NULL) || (len > 8U))
     {
-        // 如果邮箱已满，可以选择等待或者采取其他操作
-        // 例如，可以添加一个超时机制或者直接返回错误状态
-        // Monitor::instance()->Log_Messages(Monitor::WARNING, (uint8_t *)"CAN Tx Mailbox is full\r\n");
         return;
     }
-    // TODO: 校验标准帧 ID 和 DLC (0~8)，构造帧头并调用 HAL_CAN_AddTxMessage。
-    (void)Id;
-    (void)msg;
-    (void)len;
+    // 只支持标准帧，11 位 ID 最大 0x7FF
+    if (Id > 0x7FFU)
+    {
+        return;
+    }
+    // 邮箱满了就放弃本帧，避免覆盖尚未发出的报文（后续可改为等待/重试）
+    if (HAL_CAN_GetTxMailboxesFreeLevel(hcan) == 0U)
+    {
+        return;
+    }
+
+    tx_header.StdId = Id;
+    tx_header.ExtId = 0U;
+    tx_header.IDE   = CAN_ID_STD;    // 标准帧
+    tx_header.RTR   = CAN_RTR_DATA;  // 数据帧
+    tx_header.DLC   = len;
+    tx_header.TransmitGlobalTime = DISABLE;
+
+    (void)HAL_CAN_AddTxMessage(hcan, &tx_header, msg, &mailbox);
 }
 
-// TODO: 实现 CAN 接收回调，根据总线和标准帧 ID 分发电机反馈。
+/**
+ * @brief CAN 接收数据出口（弱符号）。
+ * @note 与 USART_RxCallback 同一约定：上层可实现同名函数覆盖本弱符号，
+ *       用来处理收到的 CAN 报文（如电机反馈解析）。这里只交出「哪条总线 + 标准帧 ID +
+ *       8 字节数据」，具体的 ID→电机映射属于上层协议，不放进 bsp/，以免 bsp 反向依赖 modules/。
+ * @param hcan 收到报文的 CAN 句柄
+ * @param StdId 标准帧 ID
+ * @param data 指向报文数据的指针（指向中断栈上的临时缓冲，需要保留请自行拷贝）
+ */
+__attribute__((weak)) void CAN_RxCallback(CAN_HandleTypeDef *hcan, uint32_t StdId, uint8_t *data)
+{
+    (void)hcan;
+    (void)StdId;
+    (void)data;
+}
+
+/**
+ * @brief CAN RX FIFO0 收到报文的中断回调（HAL 弱函数）。
+ * @note CAN_Init 里已对两个 CAN 使能 CAN_IT_RX_FIFO0_MSG_PENDING，
+ *       HAL_CAN_IRQHandler 会在 FIFO0 有报文时调用本函数。中断上下文里只取帧、不发送、不阻塞。
+ */
+extern "C" void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+    CAN_RxHeaderTypeDef rx_header;
+    uint8_t rx_data[8];
+
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rx_header, rx_data) != HAL_OK)
+    {
+        return;
+    }
+    // 本工程只处理数据帧里的标准帧
+    if ((rx_header.IDE != CAN_ID_STD) || (rx_header.RTR != CAN_RTR_DATA))
+    {
+        return;
+    }
+
+    CAN_RxCallback(hcan, rx_header.StdId, rx_data);
+}
