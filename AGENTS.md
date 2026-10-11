@@ -221,12 +221,37 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - 未做（C 后续）：`ReadAccData`/`ReadGyroData`/`ReadAccTemperature`/`Verify*Data`（步骤 2）、
   `Config()`/`Calibrate()` 接入与数据共享出口（步骤 3）；`TemperatureControl` + `bsp_pwm.cpp` 属方向 D。
 
+**2026-10-11 · 方向 D 步骤 1：PWM 封装（TODO #2）代码完成并上板验证**
+
+- `bsp/src/bsp_pwm.cpp`（TODO #2）实现完成：
+  - `PWM_TimerClock()`：APB 定时器在 APB 预分频 ≠ 1 时时钟是 PCLK 的 2 倍；本工程 APB1(/4)→84 MHz、
+    APB2(/2)→168 MHz，**两个域都要 ×2**，故只需区分 APB1/APB2（TIM1/TIM8~11 在 APB2）。
+    **坑**：`TIMx` 宏是指针，不能当 `switch` 的 case 标签（C++ 报 `not a constant expression`），改用 `*_BASE` 常量 + if 链。
+  - `PWM_SetDutyRatio`：先夹到 [0,1]（`!(x>0)` 顺带挡 NaN），满量程取 **ARR+1** —— `duty=1` 时比较值 > ARR，
+    PWM1 模式下整周期为高，才是真 100 %（取 ARR 会缺最后一个计数）。
+  - `PWM_SetPeriod`：`ARR = period × timer_clk / (PSC+1) − 1`，夹到 16 位范围（TIM1/TIM10 都是 16 位）。
+  - `PWM_Start`：失败就退回停止态，**不调 `Error_Handler()`**（它在 `bsp_Init()` 里跑，死循环会带走自检和 ThreadX）。
+  - `PWM_Init()`：启动加热(TIM10_CH1) + 舵机(TIM1_CH1)，初值取安全侧：加热 **0 %**（必须先摆 0 再启动，
+    否则会按 CubeMX 的 `Pulse` 直接出功率）、舵机 **1.5 ms 中位**。开关：`PWM_HEAT_ENABLE`/`PWM_SERVO_ENABLE`/`PWM_DERIVE_PERIOD`。
+- `bsp/src/bsp.cpp`：`bsp_Init()` 加 `PWM_Init();`（`MX_TIMx_Init` 已在 `main.c` 里先跑过）。
+- `board/CMakeLists.txt`：仅改一行注释（`bsp_pwm.cpp` 本就在 `target_sources`）。
+- `PWM_DERIVE_PERIOD` 的作用：`PWM_Init` 里再用 `PWM_SetPeriod(htim10, 1/1000)`、`PWM_SetPeriod(htim1, 1/50)`
+  推一遍周期。CubeMX 已把 ARR 配成 999/19999，故"算对了行为不变、算错了 ARR 会变"
+  —— 让这条平时没有调用点的换算每次上电都执行一次，读 ARR 即可判对错。
+- 验证：① 编译 `exit=0`、**无告警**；RAM 8768 B 不变、FLASH 46260 → **47652 B**。
+  ② 烧写 `Verified OK`。③ **SWD 读寄存器**（TIM1 基址 `0x40010000`、TIM10 基址 `0x40014400`）：
+  TIM1 `CR1=0x01`(CEN)、`CCER=0x01`(CC1E)、**`ARR=19999`(50 Hz)**、**`CCR1=1500`(1.5 ms)**、**`BDTR=0xA000`(MOE=1)**；
+  TIM10 `CR1=0x01`、`CCER=0x01`、**`ARR=999`(1 kHz)**、**`CCR1=0`(不加热)**；`RCC->CFGR=0x0000940A` → PPRE1=/4、PPRE2=/2。
+  → 两条算式（秒→ARR、[0,1]→CCR）都拿到寄存器证据；TIM1 是高级定时器，`MOE=1` 由 `HAL_TIM_PWM_Start` 内部打开。
+- 未做（D 后续）：D2 `BMI088::TemperatureControl` 温控环（注意 `TempPid.maxOut=25000` 与 duty∈[0,1] 量纲不一致，需定口径）；
+  D3（选做）舵机角度接口；加热极性（duty=1 是否真加热）需实测确认。
+
 ### 3.2 待补 TODO（唯一权威清单）
 
 | # | 文件:行 | 内容 | 所属方向 | 状态 |
 |---|---|---|---|---|
 | 1 | `libs/src/pid.cpp` | 位置式/增量式 + 积分限幅 `maxIOut` + 输出限幅 `maxOut` | 地基 | **代码完成**（编译 + 数值验证；纯算法，无需上板） |
-| 2 | `bsp/src/bsp_pwm.cpp:9,14,19,24,29` | PWM 初始化/启停/周期(秒→ARR)/占空比([0,1]→CCR) | B·C | 待做 |
+| 2 | `bsp/src/bsp_pwm.cpp:9,14,19,24,29` | PWM 初始化/启停/周期(秒→ARR)/占空比([0,1]→CCR) | D | **代码完成，已上板验证**（寄存器层） |
 | 3 | `bsp/src/bsp_usart.cpp` | 双串口 DMA+空闲中断、启动接收、按 mode 发送 | A | **代码完成**；接收/发送未验（**无串口线**，见 §3.3） |
 | 4 | `bsp/src/bsp_can.cpp` | `CAN_Transmit` 组帧发送；接收回调取帧并上交上层（弱符号 `CAN_RxCallback`） | B | **代码完成，待上板验证** |
 | 5 | `modules/include/BMI088.hpp:21` | SPI 句柄 + ACC/GYRO 片选宏 | C | **代码完成，已上板验证** |
@@ -280,6 +305,17 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - [x] C · **加速度计上电坑**：`Config()` 里那次 `ACC_PWR_CTRL=0x04` 实测不生效（读回 0x00、数据恒 0），已用"写+回读校验+重试"（`EnsureAccPowered()`）修掉；两次上电均稳定
 - [ ] C · 通信失败：短接/断开 MISO 时 `*_DATA_ERR` 能置位 —— 代码就绪（判据=6 字节原始值全同），需手工动线复现
 - [ ] C · 数据共享：把 `g_imu` 的数据交给其它线程的出口（单写者约定，如需再加互斥）
+
+**待做 · D · PWM（加热电阻板载即可自验；舵机需接舵机）**
+
+- [x] D · **PWM 通道启动**：TIM1 `CR1.CEN=1`/`CCER.CC1E=1`/`BDTR.MOE=1`、TIM10 `CR1.CEN=1`/`CCER.CC1E=1` **已确认**
+- [x] D · **周期换算（秒→ARR）**：TIM10 `ARR=999`(1 kHz)、TIM1 `ARR=19999`(50 Hz) **已确认**；
+      `RCC->CFGR=0x0000940A`（PPRE1=/4、PPRE2=/2）反证 168/84 MHz 取对
+- [x] D · **占空比换算（[0,1]→CCR）**：加热 `CCR1=0`（duty=0）、舵机 `CCR1=1500`（1.5 ms 中位）**已确认**
+- [ ] D · **加热极性**：`duty=1` 应是"全功率"—— 万用表量 PF6 平均电压（应为 ~3.3 V），或设 duty=1 后看
+      `acc_data.temperature` 是否上升（**注意只短时试，别把板子烤了**）
+- [ ] D · **温控闭环（D2）**：目标温度阶跃后温度收敛、无持续振荡；目标低于当前温度时 duty 归 0
+- [ ] D · **舵机（D3，选做）**：0°/90°/180° ↔ 500/1500/2500 µs（无舵机就读 CCR1 核对）
 
 ---
 
@@ -357,6 +393,11 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 `bsp_pwm.cpp`（TODO #2）→ `BMI088::TemperatureControl`（TODO #6 中的 63 行）→（如需）舵机 PWM。
 
 **验收**：`duty=0` 不加热、`duty=1` 全功率；舵机 50Hz 下 500~2500 对应 0°~180°。
+
+**进度（2026-10-11）**：步骤 1（`bsp_pwm.cpp`，TODO #2）**代码完成并上板验证**（寄存器层：两路的
+`CEN`/`CC1E`/`ARR`/`CCR1`，TIM1 另加 `MOE`；详见 §3.1 与 §3.3 的 D 清单）。
+下一步 D2：`BMI088::TemperatureControl` 温控环 —— **先要定 `TempPid.maxOut=25000` 与 duty∈[0,1] 的量纲口径**；
+加热电阻是板载的，**没有外部硬件也能验**（设目标温度看温度收敛）。D3（舵机）为选做。
 
 ### 4.6 方向 E · alive 线程（最后做，依赖 A~D）
 

@@ -54,7 +54,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${ROOT}/bsp/src/bsp.cpp
     ${ROOT}/bsp/src/bsp_usart.cpp
     ${ROOT}/bsp/src/bsp_can.cpp
-    ${ROOT}/bsp/src/bsp_pwm.cpp   # BMI088.cpp 的 vtable 会牵到 TemperatureControl -> PWM_SetDutyRatio
+    ${ROOT}/bsp/src/bsp_pwm.cpp   # 方向 D：加热(TIM10_CH1)+舵机(TIM1_CH1) PWM 封装
     ${ROOT}/libs/src/math.cpp
     ${ROOT}/libs/src/pid.cpp
     ${ROOT}/modules/src/DJIMotorHandler.cpp

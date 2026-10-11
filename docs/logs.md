@@ -236,3 +236,76 @@ PA4/PB0 作为两组片选输出且初始为高；`VerifyAccChipID()`/`VerifyGyr
 - 量纲核对已完成，但"绕 Z 轴转板子看符号与量级"这类动态验证属手工项，尚未做。
 - 数据共享的出口（`g_imu` 给其它线程读、是否加 `tx_mutex`）与 `imu_alive` 信号量归方向 E。
 - `TemperatureControl` 与加热电阻 PWM 归方向 D。
+
+---
+
+## 2026-10-11 · 方向 D 步骤 1：PWM 封装（TODO #2）
+
+**目标**：补完 `bsp_pwm.cpp` 的 5 个空桩（初始化/启停/周期/占空比），把本工程两路 PWM 的用途与量纲钉死。
+**本轮只做驱动本身**，不碰温控环（`TemperatureControl` 属 D2）—— 万一不对，能立刻确定问题出在 PWM 通道/时钟换算，而不是控制逻辑。
+
+**现象（起点）**：`board/Core/Src/tim.c` 里 CubeMX 已经配好两路：
+
+- 加热电阻 TIM10_CH1 = PF6，PSC=167 / ARR=999 → **1 kHz**，初始 `Pulse=0`；
+- 舵机 TIM1_CH1 = PE9，PSC=167 / ARR=19999 → **50 Hz**，初始 `Pulse=10000`（1.5 ms 中位）。
+
+两者 PSC 都是 167，故 **1 tick = 1 µs**：50 Hz 那路 20000 tick/周期，**CCR 直接就是脉宽微秒数**。
+而 `bsp_pwm.cpp` 里 5 个函数全是 TODO 空桩 —— 其中 `PWM_SetDutyRatio` 已被 `BMI088::TemperatureControl` 引用，
+所以它一直"进得了固件、但什么都不做"。
+
+**猜想 / 要先想清楚的三个点**：
+
+1. 唯一非平凡的是 `PWM_SetPeriod` 的"秒 → ARR"：得先拿到**定时器的实际输入时钟**。F4 的 APB 定时器在
+   APB 预分频 ≠ 1 时是 PCLK 的 **2 倍**；本工程 APB1 = 42 MHz(/4) → 84 MHz、APB2 = 84 MHz(/2) → 168 MHz，
+   **两个域都要乘 2**，于是只需区分挂在哪条 APB 上（TIM1 / TIM8~11 在 APB2）。
+2. `duty=1` 想表达"全功率"：若满量程取 ARR，PWM1 模式下还会缺最后一个计数，故取 **ARR+1**
+   —— `duty=1` 时比较值 > ARR，输出整周期为高，才是真正的 100 %。
+3. 没有串口线、也没有示波器，验证只能走 **SWD 读定时器寄存器**
+   （TIM1 基址 `0x40010000`、TIM10 基址 `0x40014400`；读 `CR1`/`CCER`/`ARR`/`CCR1`，TIM1 另加 `BDTR`）。
+
+**改动**：
+
+- `bsp/src/bsp_pwm.cpp`：补完 5 个函数。
+  - `PWM_TimerClock()` 取定时器时钟。**坑**：一开始用 `switch ((uint32_t)TIMx)` 写，编译报
+    `reinterpret_cast<TIM_TypeDef*>(...) is not a constant expression` —— `TIMx` 宏是指针，**C++ 里不能当 case 标签**；
+    改成 `*_BASE` 常量 + if 链。
+  - `PWM_SetDutyRatio`：先夹到 [0,1]（写成 `!(x > 0)` 顺带挡住 NaN）再写 CCR，满量程 `ARR+1`。
+  - `PWM_SetPeriod`：`ARR = period × timer_clk / (PSC+1) − 1`，并夹到 16 位范围（本工程两路都是 16 位定时器）。
+  - `PWM_Start`：句柄空就返回；`HAL_TIM_PWM_Start` 失败则退回停止态。**不调 `Error_Handler()`** ——
+    它在 `bsp_Init()` 里被调用，死循环会把后面的自检和 ThreadX 一起带走，退回安全状态反而更好定位（同 `CAN_Transmit` 的取舍）。
+  - `PWM_Init()`：启动加热(TIM10_CH1)与舵机(TIM1_CH1)两路，初值都取安全侧 —— 加热 **0 %**
+    （必须先摆 0 再启动，否则会按 CubeMX 的 `Pulse` 直接出功率）、舵机 **1.5 ms 中位**；
+    另留 `PWM_HEAT_ENABLE` / `PWM_SERVO_ENABLE` / `PWM_DERIVE_PERIOD` 三个开关。
+- `bsp/src/bsp.cpp`：`bsp_Init()` 里加 `PWM_Init();`（`MX_TIMx_Init` 已在 `main.c` 里先跑过，顺序安全）。
+- `board/CMakeLists.txt`：只改了一行注释（`bsp_pwm.cpp` 早就在 `target_sources` 里）。
+
+**关于 `PWM_DERIVE_PERIOD`**：`PWM_Init` 里额外用 `PWM_SetPeriod(&htim10, 1/1000)`、`PWM_SetPeriod(&htim1, 1/50)`
+再推导一遍周期。CubeMX 已经把 ARR 配成 999 / 19999，所以**算对了行为不变、算错了 ARR 会变**
+—— 等于让这条平时没有调用点的换算每次上电都被执行一次，上板读 ARR 就能判对错。
+
+**结果**：
+
+| 项 | 实测 | 判读 |
+|---|---|---|
+| 编译 | `exit=0`、**无告警**；RAM 8768 B 不变、FLASH 46260 → **47652 B** | 增量都是被真正调用的 HAL 启动代码 |
+| 烧写 | `Verified OK`、`device id = 0x10076413`、目标 3.261 V | 烧写链正常 |
+| TIM1（舵机 PE9） | `CR1=0x01`(CEN=1)、`CCER=0x01`(CC1E=1)、**`ARR=0x4E1F=19999`**、**`CCR1=0x5DC=1500`**、**`BDTR=0xA000`(MOE=1)** | 通道真在输出；ARR/CCR 与两条算式逐项吻合 |
+| TIM10（加热 PF6） | `CR1=0x01`、`CCER=0x01`、**`ARR=0x3E7=999`**、**`CCR1=0`** | 同上；加热初值确实在安全侧 |
+| `RCC->CFGR` | `0x0000940A`：HPRE=/1、**PPRE1=0b101(/4)**、**PPRE2=0b100(/2)** | 反证 `PWM_TimerClock()` 推的 168 / 84 MHz 没错（ARR 算对的前提） |
+
+**结论**：
+
+1. 5 个函数全部实现并**上板验证**：`PWM_SetPeriod` 的"秒 → ARR"（999 / 19999）与 `PWM_SetDutyRatio` 的
+   [0,1] → CCR（0 / 1500）都拿到了寄存器证据，不是"看代码觉得对"。
+2. TIM1 是**高级定时器**，除 `CEN` 外还必须 `MOE=1` 才有输出 —— 实测 `BDTR` bit15 = 1，
+   说明 `HAL_TIM_PWM_Start` 内部替我们开了主输出。
+3. 满量程取 `ARR+1` 的理由成立，duty 两端落在真正的 0 % / 100 %。
+
+**遗留 / 下一步（D 的后续步骤）**：
+
+- **D2**：`BMI088::TemperatureControl`（`modules/src/BMI088.cpp:96`）用 `TempPid` 算占空比 —— 注意老师给的
+  `TempPid.maxOut = 25000` 与 duty ∈ [0,1] **量纲不一致**，要么在函数里显式归一化再夹紧，要么把 `maxOut` 改成 1.0，需留档说明选哪个。
+  接进 imu 线程循环即可，板载加热电阻**无需外部硬件**就能验（设目标 40 ℃，看温度上升 + duty 收敛）。
+- **D3（选做）**：舵机角度接口（0°~180° ↔ 500~2500 µs，即 CCR 500~2500）。注意 `tim.c` 目前只配了 TIM1_CH1，
+  J16 的 C2~C7（TIM1_CH2~4 / TIM8_CH1~3）要用得先回 CubeMX 加。
+- **极性未实测**：若"duty=1 反而变凉"，说明驱动是低有效，需改 OCPolarity 或在 bsp 层取反。
