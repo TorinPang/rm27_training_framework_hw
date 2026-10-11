@@ -23,7 +23,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "threads.hpp"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -62,7 +62,11 @@ UINT App_ThreadX_Init(VOID *memory_ptr)
   TX_BYTE_POOL *byte_pool = (TX_BYTE_POOL*)memory_ptr;
 
   /* USER CODE BEGIN App_ThreadX_Init */
-  (void)byte_pool;
+  (void)byte_pool; /* 本工程的线程用静态栈，不用 CubeMX 的 byte pool */
+
+  /* 创建应用线程。线程必须在两处之一创建：tx_application_define() 的调用链内，
+   * 或已运行的线程里；本工程走前者（App_ThreadX_Init 由 tx_application_define 调用）。 */
+  ControlThread_Init(); /* 方向 B：control 线程，1 ms 周期跑电机控制 */
   /* USER CODE END App_ThreadX_Init */
 
   return ret;
