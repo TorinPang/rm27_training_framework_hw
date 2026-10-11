@@ -1,0 +1,53 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+        "label": "cmake-configure-debug",
+        "type": "shell",
+        "command": "cmake",
+        "args": [
+            "--preset",
+            "Debug"
+        ],
+        "group": "build",
+        "problemMatcher": []
+    },
+    {
+        "label": "cmake-build-debug",
+        "type": "shell",
+        "command": "cmake",
+        "args": [
+            "--build",
+            "--preset",
+            "Debug"
+        ],
+        "dependsOn": "cmake-configure-debug",
+        "group": {
+            "kind": "build",
+            "isDefault": true
+        },
+        "problemMatcher": "$gcc"
+    },
+    {
+        "label": "flash-openocd",
+        "type": "shell",
+        "command": "openocd",
+        "options": {
+            "cwd": "${workspaceFolder}"
+        },
+        "args": [ 
+            "-f", //TODO: 在下面切换烧录器
+            // "interface/cmsis-dap.cfg",
+            "interface/stlink.cfg",
+            // "interface/jlink.cfg",
+            "-f",
+            //"target/stm32h7x.cfg",//TODO:改为实际芯片类型
+            "target/stm32f4x.cfg",
+            "-c",
+            "program board/build/Debug/board.elf reset exit"  //TODO:替换真实的.elf文件名
+        ],
+        "dependsOn": "cmake-build-debug",
+        "problemMatcher": []
+    }
+]
+}
