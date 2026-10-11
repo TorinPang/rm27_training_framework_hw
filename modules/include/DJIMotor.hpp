@@ -62,8 +62,17 @@ public:
     uint16_t canId;                   ///< 电机的CAN通信ID
     CAN_HandleTypeDef *hcan;          ///< 指向电机使用的CAN接口的指针
 
-    PID speedPid = PID(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, PID_POSITION); ///< TODO: 配置速度环参数
-    PID positionPid = PID(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, PID_POSITION); ///< TODO: 配置位置环参数
+    /* ---------------- 双环 PID（均为位置式） ----------------
+     * 量纲约定：
+     *   速度环：输入 = 输出轴角速度(rad/s)，输出 = 电流指令(原始计数，±10000 对应 ±10A)
+     *   位置环：输入 = 输出轴角度(rad)，输出 = 速度给定(rad/s)，串级送入速度环
+     * 增益为 M2006 起步值（先纯 P 保证安全），上板后按“先 P、后 I、再 D”整定。
+     * maxOut / maxIOut 是与电机相关的量，由派生类构造函数按各自型号设置（见 M2006.cpp）：
+     *   speedPid.maxOut    = maxCurrent     （电流指令上限）
+     *   positionPid.maxOut = 输出轴转速上限（速度给定上限）
+     * 此处保持 0 作安全默认：万一派生类忘记设置，输出为 0 而非失控。 */
+    PID speedPid = PID(30.0f, 0.0f, 0.0f, 0.0f, 0.0f, PID_POSITION);
+    PID positionPid = PID(10.0f, 0.0f, 0.0f, 0.0f, 0.0f, PID_POSITION);
 
     float speedSet;    ///< 设定的目标速度
     float positionSet; ///< 设定的目标位置，范围[-Π, Π]

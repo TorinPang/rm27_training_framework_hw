@@ -123,6 +123,28 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - **串口项未验收**：用户**手上没有串口线**，`[rm27] boot ok` 是否打印出来尚未确认 —— 方向 A 保持"部分验收"，
   串口三条留在 §3.3 等有串口线后一次性跑完。
 
+**2026-10-11 · 方向 B 步骤 3：`M2006` 参数与双环（TODO #7/#8）**
+
+- `modules/include/DJIMotor.hpp:65,66`：填**起步增益**（速度环 `kp=30`、位置环 `kp=10`，均为位置式、先纯 P 保证安全）；
+  `maxOut`/`maxIOut` 保持 **0 作安全默认**，由派生类按型号绑定。
+  量纲约定：速度环输入 rad/s、输出电流指令(原始计数)；位置环输入 rad、输出速度给定(rad/s)，串级进速度环。
+- `modules/src/M2006.cpp`：
+  - 构造：`gearBox=GearBox_M2006`、`maxCurrent=10000`（C610 ±10000 ↔ ±10A），绑定
+    `speedPid.maxOut=maxCurrent`、`speedPid.maxIOut=3000`、`positionPid.maxOut=maxIOut=20 rad/s`（保守起步值，官方空载 500 rpm ≈ 52.36 rad/s 为天花板）。
+  - `setOutput()`：RELAX → 0 并清 PID；SPD → 速度环；POS → 位置环串速度环。均以 `Numeric::LimitABS(result, maxCurrent)` 落 `currentSet`。
+    另加**离线保护**：`MotorState != MOTOR_ONLINE` 时输出 0 并清 PID（避免反馈丢失后速度环积分饱和失控）。
+  - `AliveCheck()`：比较 `AliveFlag`/`Pre_AliveFlag` 后**无条件**记录 `Pre_AliveFlag`（参考工程只在 online 分支记录，属可改进点）。
+- `board/CMakeLists.txt`：`target_sources` 加 `modules/src/M2006.cpp`。
+- 验证：① 编译 `exit=0`、无告警；**镜像大小不变**（RAM 6056 B / FLASH 35660 B）——
+  因尚无代码构造 `M2006`，其 `.text` 全部落在 `board.map` 的 `Discarded input sections`，要等步骤 4 的 control 线程接上才进固件。
+  ② 算法层 Python 复现（**非执行 C++**）：构造默认值、RELAX 归零、离线保护、速度环方向与饱和、位置环串级与各级限幅、
+  NaN 反馈自清且可恢复、AliveCheck 状态机、全域无越界 —— **25/25 通过**（脚本 `%TEMP%\m2006_step3_check.py`）。
+- **官方规格已核对**（RoboMaster 产品页 + C610 用户手册）：减速比 36:1；C610 可控电流 -10000~10000（±10A）；
+  反馈为**转子**机械角 + 转速(rpm)；CAN 1 Mbps；**无绝对位置传感器**（`positionFdb` 为增量累加的相对角，POS 模式前需归零）。
+- **待实测确认的唯一常数**：编码器每圈计数 **8192 还是 8191**（我们取 8192、回绕 ±4096；参考工程注释用 8191）。
+  复核法：手动转输出轴整一圈，看 `ecd` 增量是否 ≈ `8192 × 36`。
+- 未做（B 后续）：`control` 线程（步骤 4）；PID 增益**必须上板整定**，当前为保守起步值。
+
 ### 3.2 待补 TODO（唯一权威清单）
 
 | # | 文件:行 | 内容 | 所属方向 | 状态 |
@@ -133,8 +155,8 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 | 4 | `bsp/src/bsp_can.cpp` | `CAN_Transmit` 组帧发送；接收回调取帧并上交上层（弱符号 `CAN_RxCallback`） | B | **代码完成，待上板验证** |
 | 5 | `modules/include/BMI088.hpp:21` | SPI 句柄 + ACC/GYRO 片选宏 | C | 待做 |
 | 6 | `modules/src/BMI088.cpp:63,106,111,116,126,208,215,222` | 温控占空比、数据校验、寄存器读写、三轴/温度解析 | C | 待做 |
-| 7 | `modules/src/M2006.cpp:5,11,12,18` | 构造参数、松开/速度/位置双环、`maxCurrent` 限幅、`AliveCheck` | B | 待做 |
-| 8 | `modules/include/DJIMotor.hpp:65,66` | 速度环/位置环 PID 参数 | B | 待做 |
+| 7 | `modules/src/M2006.cpp` | 构造参数、松开/速度/位置双环、`maxCurrent` 限幅、离线保护、`AliveCheck` | B | **代码完成，待上板整定**（PID 增益为起步值） |
+| 8 | `modules/include/DJIMotor.hpp:65,66` | 速度环/位置环 PID 参数 | B | **代码完成，待上板整定** |
 | 9 | `modules/src/DJIMotorHandler.cpp` | 注册(0x201~0x208)、0x200/0x1FF 存在标志、组帧大端序、反馈解析+编码器回绕+减速比换算、存活检查；并实现强符号 `CAN_RxCallback` | B | **代码完成，待上板验证** |
 | 10 | `threads/*`（空） | alive / imu / control 三个线程 + `main.c` 创建 | A~E | 待做 |
 | 11 | LED 模块 | 自行封装 GPIO（`bsp/` 下新增），供 alive 线程做灯效 | E | 待做 |
@@ -157,6 +179,11 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - [ ] B · CAN 发送：RELAX 模式下确认 0x200/0x1FF 报文 ID 与 8 字节大端序，电流为 0
 - [ ] B · CAN 接收：电机上电后能收到 0x201~0x208 反馈，`CAN_RxCallback` 被触发（先用打印肉眼确认）
 - [ ] B · 反馈解析：转轴看 `positionFdb`/`speedFdb` 是否合理、跨编码器回绕（0↔8191）不跳变
+- [ ] B · **手册复核**：手动转输出轴**整一圈**，确认编码器计数/圈（8192 还是 8191）与减速比 36 同时成立
+- [ ] B · RELAX 电流为 0：`control` 线程跑起来后，确认 0x200 报文里电流字节为 0（步骤 4 之后才能验）
+- [ ] B · 速度环跟随：给 `speedSet` 阶跃，看 `speedFdb` 收敛、无持续振荡（**PID 需先整定**）
+- [ ] B · 双环位置：`positionSet` 到位后停住、超调可接受（注意 `positionFdb` 无绝对零点，需先归零）
+- [ ] B · 离线检测：拔 CAN，`AliveCheck` 应在下一周期转 OFFLINE 且 `currentSet` 归 0
 
 ---
 
