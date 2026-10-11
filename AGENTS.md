@@ -145,6 +145,51 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
   复核法：手动转输出轴整一圈，看 `ecd` 增量是否 ≈ `8192 × 36`。
 - 未做（B 后续）：`control` 线程（步骤 4）；PID 增益**必须上板整定**，当前为保守起步值。
 
+**2026-10-11 · 方向 B 步骤 4：`control` 线程（TODO #10 的 control 部分）**
+
+- 新建 `threads/src/controlthread.cpp`，并填 `threads/include/threads.hpp`：
+  - **静态栈 1024 B**（`__attribute__((aligned(8)))`，ThreadX 要求 8 字节对齐）+ `TX_THREAD`；优先级 8、`TX_NO_TIME_SLICE`、`TX_AUTO_START`；
+    周期 `tx_thread_sleep(1)` = **1 ms**（`tx_user.h: TX_TIMER_TICKS_PER_SECOND = 1000`）。
+  - `M2006 control_motor` 放**静态存储**（不能放线程栈，生命周期要覆盖整个运行期）：`registerMotor(&hcan1, 0x201)`
+    → 置 `CAN1_0x200_Exist`，此后 `sendControlData` 才真正发 0x200。
+  - 循环次序：`AllMotorAliveCheck()`（先用上周期反馈更新在线状态）→ `setOutput()`（算电流）→ `sendControlData()`（发出）→ sleep。
+  - 顶部有上板调试开关 `CONTROL_TEST_MODE`（0=RELAX / 1=SPD / 2=POS）与 `CONTROL_TEST_SPEED/POS`，风格同 `main.c` 的 `BSP_SELF_TEST`。
+- `board/Core/Src/app_threadx.c`：`USER CODE BEGIN Includes` 加 `#include "threads.hpp"`；`USER CODE BEGIN App_ThreadX_Init` 调 `ControlThread_Init()`。
+  - **修正 TODO #10 的原始说法**：线程创建**不放** `main.c` —— ThreadX 只允许在 `tx_application_define()` 调用链内或已运行的线程里创建线程，
+    故走 `app_threadx.c`（`tx_application_define` → `App_ThreadX_Init`）。
+  - `threads.hpp` 里函数用 `extern "C"` 包住，否则 C 文件 `app_threadx.c` 链接不到 C++ 符号。
+- `board/CMakeLists.txt`：`target_sources` 加 `threads/src/controlthread.cpp`。
+- 验证：编译 `exit=0`、无告警；RAM 6056 → **7456 B (+1400)**、FLASH 35660 → **39612 B (+3952)**。
+  - RAM 增量（`nm` 实测）= 线程栈 1024 + `TX_THREAD` 176 + `M2006` 对象 192。
+  - FLASH 增量 = 本框架新活代码（`M2006::setOutput` 308、`PID::UpdateResult` 412、`DJIMotorHandler::sendControlData` 208 等）
+    + **首次引入带析构函数的全局对象** ⇒ `_GLOBAL__sub_I_ControlThread_Init` / `__aeabi_atexit` / `__cxa_atexit` 注册，
+    连带把 `operator delete` → newlib `malloc/free`（`_malloc_r` 256 B）拉进固件（析构永不执行，属无害开销）。
+  - `DJIMotorHandler::Instance()` 的局部静态因成员初值全为常量表达式而**被常量初始化**（无 `__cxa_guard_*`），
+    故在内核启动前调用它不存在加锁/竞态问题。
+- 未做：`alive` / `imu` 两个线程（属 A/C/E 方向）；`main.c` 无需改动。
+
+**2026-10-11 · 第二次上板：内核启动 + `control` 线程运行验证（无电机，只读内存）**
+
+- 背景：步骤 4 首次引入"全局 C++ 对象构造 + 在内核里创建线程"，需确认 ThreadX 仍能正常启动。
+  手上**只有板子，没有电机、没有串口线**，故不靠打印，**用 SWD 直接读内存**。
+- 方法：`arm-none-eabi-nm` 取符号地址 → OpenOCD `init; halt; mdw …; resume; sleep 1500; halt; mdw …; reset run; shutdown`。
+  两次采样 `control_thread.tx_thread_run_count`（`TX_THREAD` 偏移 4）。
+- 结果：
+  - 烧写 `Verified OK`（`device id 0x10076413`、目标 3.261 V）。
+  - `_tx_thread_system_state = 0`（内核正常调度）、`_tx_thread_created_count = 2`（idle + control）。
+  - `control_thread`：id `'THRD'`、priority 8、preempt 8、`state = TX_SLEEP`；**`run_count` 58610 → 60118（1.5 s）= +1508 ≈ 1.005 ms/轮**；
+    栈 `0x20001110`~`0x2000150F`（1024 B），**水位仅 339 B**。
+  - `control_motor`（0x20001510，大小 192 B）逐字段与设计一致：`canId=0x201`、`hcan=&hcan1`、
+    `speedPid`(kp30/限幅10000/3000)、`positionPid`(kp10/限幅20/20)、`speedSet=5.0`、`positionSet=1.0`、
+    `maxCurrent=10000`、`gearBox=GearBox_M2006`、`MotorState=OFFLINE`、`controlMode=RELAX`。
+    → 构造函数与 `registerMotor` 确实执行了。
+  - CAN1：`ESR` BOFF=1（TEC=248）、`TSR` 三邮箱全满、邮箱内容 **STID=0x200 / IDE=0 / RTR=0 / DLC=8 / 8 字节全 0**；
+    `BTR` = BRP3/TS1·10/TS2·3 → **1 Mbps**。
+- 结论：**内核启动 + 1 ms 控制周期均验证通过**；无电机时 CAN bus-off 属协议行为。
+  寄存器层顺带验掉 B 清单三条（报文 ID `0x200`+DLC8、RELAX 电流为 0、波特率 1 Mbps）。
+- 注：`_tx_thread_current_ptr` 读到 0 是**正常**的 —— Cortex-M port 在调度器里刻意置 NULL
+  （`tx_thread_schedule.S`），当前线程由 `_tx_thread_execute_ptr` + PSP 跟踪。
+
 ### 3.2 待补 TODO（唯一权威清单）
 
 | # | 文件:行 | 内容 | 所属方向 | 状态 |
@@ -158,7 +203,7 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 | 7 | `modules/src/M2006.cpp` | 构造参数、松开/速度/位置双环、`maxCurrent` 限幅、离线保护、`AliveCheck` | B | **代码完成，待上板整定**（PID 增益为起步值） |
 | 8 | `modules/include/DJIMotor.hpp:65,66` | 速度环/位置环 PID 参数 | B | **代码完成，待上板整定** |
 | 9 | `modules/src/DJIMotorHandler.cpp` | 注册(0x201~0x208)、0x200/0x1FF 存在标志、组帧大端序、反馈解析+编码器回绕+减速比换算、存活检查；并实现强符号 `CAN_RxCallback` | B | **代码完成，待上板验证** |
-| 10 | `threads/*`（空） | alive / imu / control 三个线程 + `main.c` 创建 | A~E | 待做 |
+| 10 | `threads/src/controlthread.cpp`、`threads/include/threads.hpp`、`Core/Src/app_threadx.c` | **control 线程已完成**（1 ms、静态栈、优先级 8）；alive / imu 线程待做。创建位置由 `main.c` 修正为 `app_threadx.c` | A~E | **部分完成**（control 代码完成，待上板） |
 | 11 | LED 模块 | 自行封装 GPIO（`bsp/` 下新增），供 alive 线程做灯效 | E | 待做 |
 
 ### 3.3 上板验证清单
@@ -167,6 +212,11 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 
 - [x] **烧写 + 运行自检**（2026-10-11）：`program … verify` → `Verified OK`；复位后三色灯齐亮 500 ms 再灭
       → 时钟 / 烧写 / 运行全通。（`BSP_SELF_TEST` 开关留在 `main.c`，改 0 即不再执行、代码保留。）
+- [x] **内核启动 + control 线程运行**（2026-10-11，无电机，SWD 读内存）：`_tx_thread_system_state=0`、
+      2 个线程已建；`control_thread.run_count` 1.5 s 内 +1508 ≈ **1 ms/轮**；栈水位 339/1024 B；
+      `control_motor` 各字段与设计一致（见 §3.1）。
+- [x] **CAN 发送链已执行（寄存器层）**：`CAN1->ESR` BOFF=1、`TSR` 三邮箱全满、邮箱内容
+      **STID=0x200 / DLC=8 / 8 字节全 0**；`BTR` → **1 Mbps**。无电机故 TEC 累加到 248 后 bus-off（协议行为）。
 
 **待做 · A · 串口 —— 当前阻塞：手上没有串口线**
 
@@ -176,11 +226,14 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 
 **待做 · B · CAN（需电机 + CAN 分析仪/上位机）**
 
-- [ ] B · CAN 发送：RELAX 模式下确认 0x200/0x1FF 报文 ID 与 8 字节大端序，电流为 0
+- [x] B · CAN 发送：**报文 ID `0x200`、标准帧、数据帧、DLC=8 已在寄存器层确认**（2026-10-11，见 §3.1）；
+      余下"**8 字节大端序**"需电机接上后给**非零电流**才能证（全 0 数据无法区分字节序）
+- [x] B · RELAX 电流为 0：`CONTROL_TEST_MODE=0` 应发 0 电流 —— 邮箱内容 8 字节全 `0x00` **已确认**
+- [x] B · 控制线程在跑：`control_thread` 状态 `TX_SLEEP`、`run_count` 约 1005 次/秒、栈水位 339/1024 B **已确认**
+- [x] B · **总线只有本机时的现象**：无电调/分析仪应答时 `ESR` BOFF=1、TEC=248、邮箱积压 —— **已实测复现**，属协议行为、非软件 bug
 - [ ] B · CAN 接收：电机上电后能收到 0x201~0x208 反馈，`CAN_RxCallback` 被触发（先用打印肉眼确认）
 - [ ] B · 反馈解析：转轴看 `positionFdb`/`speedFdb` 是否合理、跨编码器回绕（0↔8191）不跳变
 - [ ] B · **手册复核**：手动转输出轴**整一圈**，确认编码器计数/圈（8192 还是 8191）与减速比 36 同时成立
-- [ ] B · RELAX 电流为 0：`control` 线程跑起来后，确认 0x200 报文里电流字节为 0（步骤 4 之后才能验）
 - [ ] B · 速度环跟随：给 `speedSet` 阶跃，看 `speedFdb` 收敛、无持续振荡（**PID 需先整定**）
 - [ ] B · 双环位置：`positionSet` 到位后停住、超调可接受（注意 `positionFdb` 无绝对零点，需先归零）
 - [ ] B · 离线检测：拔 CAN，`AliveCheck` 应在下一周期转 OFFLINE 且 `currentSet` 归 0
@@ -245,6 +298,10 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - 速度环单独可调；位置+速度双环可调；
 - 示波器/上位机确认 CAN 报文 ID（0x200 / 0x1FF）与 8 字节大端序正确；
 - 反馈解析正确，编码器回绕不跳变。
+
+**进度（2026-10-11）**：四步代码**全部完成**并编译通过（`bsp_can` → `DJIMotorHandler` → `M2006` + PID 参数 → `control` 线程）。
+**但 B 一步都还没上板验收** —— 它的验收项全部需要电机 + CAN 分析仪；硬件就绪后按 §3.3 的 B 清单逐条勾。
+两处口径要留意：① PID 增益只是**起步值**，必须上板整定；② 编码器 **8192 vs 8191** 待实测。
 
 ### 4.4 方向 C · SPI → BMI088
 

@@ -56,3 +56,68 @@
 
 **排错提示（本次未用到，先记下）**：OpenOCD 的输出走 **stderr**，PowerShell 会把整段标红成
 `NativeCommandError`——**那不是错误**，只看 `exit=0` 和日志里的 `Verified OK`。
+
+---
+
+## 2026-10-11 · 第二次上板：验证 ThreadX 内核启动 + `control` 线程在跑（无电机）
+
+**目标**：方向 B 步骤 4 之后新增了"全局 C++ 对象构造 + 内核里创建线程"，这是首次让用户代码
+跑进 ThreadX 调度器。**手上只有板子、没有电机、也没有串口线**，所以本轮只验一件事：
+**内核能不能正常启动、`control` 线程能不能被调度。** 不验电流、不验电机反馈。
+
+**现象（起点）**：`control` 线程上一轮只做到"编译通过"，镜像里已经有它，但从未上电跑过。
+
+**猜想 / 验证思路**：没有串口线，就不能靠打印。换个办法——**用 SWD 直接读内存**，这不需要任何外设：
+
+1. `ThreadX` 的 `TX_THREAD` 控制块是普通全局变量，能直接读；
+2. 其中 `tx_thread_run_count`（偏移 4）每被调度一次就 +1 —— **间隔 1.5 s 读两次、看差值是否 ≈1500**，
+   就能同时证明"线程在跑"和"周期是 1 ms"；
+3. `_tx_thread_system_state` 为 0 表示内核已脱离初始化、正常调度；
+4. `control_motor` 对象里的 `canId` / `hcan` / PID 增益与限幅，能反过来证明构造函数与 `registerMotor` 真的执行了；
+5. **无电机时 CAN 必然收不到 ACK**，所以读 `CAN1->ESR` 应看到 BOFF（bus-off）——这本身就能证明
+   "control 线程确实走到并执行了发送"，同时读 `CAN1->BTR` 可直接复核波特率；读发送邮箱还能看到**报文内容**。
+
+先取符号地址（`arm-none-eabi-nm --print-size`），再取 `TX_THREAD` 结构布局
+（`board/Middlewares/ST/threadx/common/inc/tx_api.h`）：`tx_thread_id`@0、`tx_thread_run_count`@4、
+`tx_thread_stack_ptr`@8、`stack_start`@12、`stack_end`@16、`stack_size`@20、`name`@40、`priority`@44、`state`@48。
+
+**改动**：**不改任何代码**，只烧录 + 读内存。
+
+**结果**：
+
+| 项 | 实测 | 判读 |
+|---|---|---|
+| 烧写 | `Verified OK`、`device id = 0x10076413`、flash 1024 KiB、目标电压 3.261 V | 烧写链正常 |
+| `_tx_thread_system_state` @0x20000010 | `0` | **内核已在正常调度**（非初始化态） |
+| `_tx_thread_created_count` @0x200000D4 | `2` | 已建 2 个线程（idle + control） |
+| `control_thread.tx_thread_id` | `0x54485244` = `'THRD'` | 控制块有效 |
+| …`tx_thread_run_count` | 58610 → **60118**（1.5 s 后） | **+1508 ≈ 1005 次/秒 → 周期 1.005 ms** |
+| …`tx_thread_priority` / `preempt_threshold` | `8` / `8` | 与 `CONTROL_THREAD_PRIORITY=8` 一致 |
+| …`tx_thread_state` | `4` = `TX_SLEEP` | 正睡在 `tx_thread_sleep(1)`，符合预期 |
+| …`stack_start` / `stack_end` / `stack_size` | `0x20001110` / `0x2000150F` / `1024` | 与 `control_thread_stack` 符号完全吻合 |
+| 栈水位（`stack_end - stack_ptr`） | 0x150F − 0x13BC = **339 B** / 1024 | 余量充足（约用 1/3） |
+| `CAN1->ESR` @0x40006418 | `0x00F80057` → **BOFF=1**、TEC=248、LEC=5(Bit0Error) | **发送确实执行过**；无应答→bus-off |
+| `CAN1->TSR` @0x40006408 | `0x82000000` → TME2/1/0=0 | 三个发送邮箱全满（帧没发出去） |
+| `CAN1 sTxMailBox[0..2]` | TIR=`0x40000001`、TDTR=`0x00000008`、TDLR/TDHR=`0` | **STID=0x200、IDE=0（标准帧）、RTR=0（数据帧）、DLC=8、8 字节全 0** |
+| `CAN1->BTR` @0x4000641C | `0x00290002` → BRP=3、TS1=10、TS2=3 | 42 MHz / (3×14) = **1 Mbps** ✅ |
+| `control_motor` 对象（0x20001510，`nm` 大小 192 B） | `canId=0x201`、`hcan=&hcan1`；`speedPid`(kp=30, maxOut=10000, maxIOut=3000)、`positionPid`(kp=10, maxOut=20, maxIOut=20)；`speedSet=5.0`、`positionSet=1.0`；`currentSet=0`、`maxCurrent=10000`、`gearBox=1`；`MotorState=0(OFFLINE)`、`controlMode=0(RELAX)` | **构造函数与 `registerMotor` 都执行了，且值与设计一致** |
+
+**结论**：
+
+1. **内核启动正常，`control` 线程以 1 ms 周期稳定运行** —— 方向 B 步骤 4 的"上板启动"这一关过了。
+2. 无电机时 **CAN 进入 bus-off 是协议行为，不是软件 bug**：帧已按 `0x200` 组好并放进邮箱，
+   只因总线上没有第二个节点回 ACK，TEC 累加到 248 → BOFF。
+3. 顺带在**寄存器层**验掉三条 B 的 §3.3 条目：报文 ID `0x200` + DLC 8 ✅、RELAX 时电流字节为 0 ✅、
+   CAN 波特率 1 Mbps ✅。（"8 字节**大端序**"仍无法由全 0 数据证明，需等电机接上给非零电流。）
+
+**顺带修正一条笔记**：ARM EABI 下 GCC **默认 `-fshort-enums`**（枚举占 1 字节），
+所以 `DJIMotor` 布局是 `MotorState`@4、`controlMode`@5、`motorFeedback`@8(32 B)、`canId`@40、
+`hcan`@44、`speedPid`@48、`positionPid`@108、`speedSet`@168、`gearBox`@188、**`sizeof`=192**。
+（用 `static_assert`/模板 `Show<N>` 编译报错法量出来的，与 RAM 实测逐字段吻合。）
+
+**遗留 / 下一步**：
+
+- 接上电机 + CAN 分析仪后，才能验：反馈解析/编码器回绕、RELAX 之外的速度环、双环位置、离线检测、
+  以及"手动转输出轴一圈"确认编码器 8192 vs 8191。
+- `CONTROL_TEST_MODE` 保持 **0（RELAX）**，最安全；整定 PID 时再改 1/2。
+- 串口三条仍挂起（无串口线）。
