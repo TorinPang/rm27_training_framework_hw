@@ -71,9 +71,14 @@ enum BMI088_SENSOR
 
 #define ACC_CONF_ADDR 0x40
 #define ACC_CONF_RESERVED 0x01
-#define ACC_CONF_BWP_OSR4 0x00
-#define ACC_CONF_BWP_OSR2 0x01
-#define ACC_CONF_BWP_NORM 0x02
+/* acc_bwp 占寄存器的 [7:4]，手册 §5.3.8 给出的有效值是 0x08 / 0x09 / 0x0A
+ * （注意都带 bit3）。用法是 (ACC_CONF_BWP_xxx << 4) | ACC_CONF_ODR_yyy，
+ * 例：正常模式 + 800 Hz = (0x0A << 4) | 0x0B = 0xAB —— Config() 里写的就是这个值。
+ * 2026-10-11 修正：这三个宏原为 0x00/0x01/0x02（少了 bit3），与手册不符；
+ * 它们此前未被任何代码使用，修正后行为不变。*/
+#define ACC_CONF_BWP_OSR4 0x08
+#define ACC_CONF_BWP_OSR2 0x09
+#define ACC_CONF_BWP_NORM 0x0A
 #define ACC_CONF_ODR_12_5_Hz 0x05
 #define ACC_CONF_ODR_25_Hz 0x06
 #define ACC_CONF_ODR_50_Hz 0x07
@@ -221,7 +226,12 @@ enum BMI088_SENSOR
 
 
     private:
-        float Gyro_offset[3]; // 陀螺仪零飘
+        /* 陀螺仪零偏（rad/s）。初值给预标定常数，而不是留空 ——
+         * 否则 Calibrate() 没跑（例如 ID 校验失败提前返回）时，
+         * ReadGyroData() 会减到未初始化内存，直接算出 NaN 污染上层。*/
+        float Gyro_offset[3] = {BMI088_GYRO_PRE_CALI_OFFSET_X,
+                                BMI088_GYRO_PRE_CALI_OFFSET_Y,
+                                BMI088_GYRO_PRE_CALI_OFFSET_Z};
     };
 
 }

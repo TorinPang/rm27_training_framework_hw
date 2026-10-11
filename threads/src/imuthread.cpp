@@ -6,22 +6,25 @@
 /* ==================================================================== *
  * 方向 C · imu 线程（TODO #10 的 imu 部分）
  *
- * 职责（最终形态）：BMI088 初始化、读三轴/温度，并把数据共享给其它线程。
+ * 职责：BMI088 初始化（芯片 ID 自检 → Config → Calibrate），随后按周期读三轴
+ *       加速度/角速度/温度并做通信自检；数据放在 g_imu 里供其它线程读。
  *
- * C1 阶段只做**读通路**的验证：不动任何寄存器，直接读两只芯片的 ID 并用三色灯表达结果。
- * 这样一旦不过，就能确定是 SPI 模式/引脚/片选的问题，与写通路无关，便于定位；
- * 数据解析（C2）、Config()/Calibrate() 与数据共享留到下一步再往这个线程里加。
+ * 现状：C1（读通路 + ID 自检）、C2（数据解析 + 单位换算 + 通信自检）已完成。
+ *       数据共享的互斥与 imu_alive 信号量属方向 E，这里先不做（单写者约定）。
  * ==================================================================== */
 
 /* ---------------- 上板调试开关（风格同 main.c 的 BSP_SELF_TEST） ----------------
- * 1 = 用三色灯显示芯片 ID 校验结果：绿 = ACC/GYRO 都读到 0x1E/0x0F；红 = 至少一个不对。
+ * 1 = 用三色灯显示 IMU 状态：
+ *       绿 = 芯片 ID 都对、且数据没被判定为通信失效（正常运行态）；
+ *       红 = 芯片 ID 不对（总线/片选/供电级故障，此时跳过 Config/Calibrate）；
+ *       蓝 = ID 对但数据被判通信失效（拔掉或短接 MISO 就能复现，用于验收 C2）。
  * 0 = 不驱动灯（方向 E 做出独立 LED 模块后，这段应删掉换成 LED 模块）*/
 #define IMU_SELF_TEST_LED 1
 
 /* ---------------- 线程参数 ---------------- */
 #define IMU_THREAD_STACK_SIZE 1024U
-#define IMU_THREAD_PRIORITY   10U   /* 比 control(8) 低：IMU 晚一拍不影响电机安全 */
-#define IMU_THREAD_TICK       100U  /* 1 tick = 1 ms；C1 阶段循环里暂时没事做 */
+#define IMU_THREAD_PRIORITY   10U /* 比 control(8) 低：IMU 晚一拍不影响电机安全 */
+#define IMU_THREAD_TICK       1U  /* 1 tick = 1 ms，与 acc 800 Hz / gyro 2000 Hz 的采样率相称 */
 
 static TX_THREAD imu_thread;
 /* ThreadX 要求线程栈 8 字节对齐 */
@@ -48,6 +51,52 @@ void ImuThread_Init(void)
                            TX_AUTO_START);
 }
 
+#if IMU_SELF_TEST_LED
+/* 三色灯刷新：红 = ID 错、蓝 = 数据错、绿 = 全好。
+ * 放在主循环里每轮刷新，这样拔掉 MISO 之后能立刻看到灯变蓝（C2 验收要求）。*/
+static void ImuLedUpdate(void)
+{
+    const bool id_err = g_imu.self_test.ACC_CHIP_ID_ERR || g_imu.self_test.GYRO_CHIP_ID_ERR;
+    const bool data_err = g_imu.self_test.ACC_DATA_ERR || g_imu.self_test.GYRO_DATA_ERR;
+
+    HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, id_err ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LED_G_GPIO_Port, LED_G_Pin, (!id_err && !data_err) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(LED_B_GPIO_Port, LED_B_Pin, (!id_err && data_err) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+#endif
+
+/* BMI088 的经典坑：ACC_PWR_CTRL / ACC_PWR_CONF 这两次写**不保证一次生效**。
+ * 本工程实测（见 docs/logs.md 第四篇）：Config() 里写完 ACC_PWR_CTRL=0x04 之后回读，
+ * 值仍是 0x00 —— 加速度计一直停在复位默认的 suspend，三轴数据寄存器恒为 0x00。
+ * 阴险的地方是芯片 ID 和温度都照常可读（温度不受 suspend 影响），
+ * 所以很容易误判成“总线是好的，只是数据不对”。
+ * 官方驱动的对策就是“写 → 回读 → 不匹配就重试”，这里照做。*/
+#define ACC_POWER_RETRY_TIMES 10U
+static void EnsureAccPowered(void)
+{
+    for (uint8_t i = 0U; i < ACC_POWER_RETRY_TIMES; ++i)
+    {
+        uint8_t cmd = ACC_PWR_CTRL_ON; // 0x04 = 加速度计上电
+        g_imu.WriteReg(BMI088::BMI088_CS_ACC, ACC_PWR_CTRL_ADDR, &cmd, 1U);
+        tx_thread_sleep(5);
+
+        uint8_t rd[2] = {0U, 0U};
+        g_imu.ReadReg(BMI088::BMI088_CS_ACC, ACC_PWR_CTRL_ADDR, rd, 2U);
+        if (rd[1] == ACC_PWR_CTRL_ON) break; // 回读一致才算真的写进去
+    }
+
+    for (uint8_t i = 0U; i < ACC_POWER_RETRY_TIMES; ++i)
+    {
+        uint8_t cmd = ACC_PWR_CONF_ACT; // 0x00 = active（脱离 suspend）
+        g_imu.WriteReg(BMI088::BMI088_CS_ACC, ACC_PWR_CONF_ADDR, &cmd, 1U);
+        tx_thread_sleep(5);
+
+        uint8_t rd[2] = {0U, 0U};
+        g_imu.ReadReg(BMI088::BMI088_CS_ACC, ACC_PWR_CONF_ADDR, rd, 2U);
+        if (rd[1] == ACC_PWR_CONF_ACT) break;
+    }
+}
+
 static void ImuThread_Entry(ULONG thread_input)
 {
     (void)thread_input;
@@ -57,7 +106,7 @@ static void ImuThread_Entry(ULONG thread_input)
     tx_thread_sleep(10);
 
     /* 热身读：重置后**第一次** SPI 事务实测出现过一次无效读（返回流里没有 0x1E），
-     * 之后每次访问都正常。故这里先做一次丢弃读，把"第一次"消耗掉。*/
+     * 之后每次访问都正常。故这里先做一次丢弃读，把“第一次”消耗掉。*/
     uint8_t warmup[2] = {0U, 0U};
     g_imu.ReadReg(BMI088::BMI088_CS_ACC, ACC_CHIP_ID_ADDR, warmup, 2U);
 
@@ -71,17 +120,38 @@ static void ImuThread_Entry(ULONG thread_input)
         g_imu.VerifyGyroChipID();
     }
 
-#if IMU_SELF_TEST_LED
+    const bool id_ok = (!g_imu.self_test.ACC_CHIP_ID_ERR) && (!g_imu.self_test.GYRO_CHIP_ID_ERR);
+
+    /* ID 过了才动寄存器：总线都不通就去软复位/写量程没有意义，
+     * 而且 Config() 里的软复位会把刚确认过的状态清掉。*/
+    if (id_ok)
     {
-        const bool id_ok = (!g_imu.self_test.ACC_CHIP_ID_ERR) && (!g_imu.self_test.GYRO_CHIP_ID_ERR);
-        HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, id_ok ? GPIO_PIN_RESET : GPIO_PIN_SET);
-        HAL_GPIO_WritePin(LED_G_GPIO_Port, LED_G_Pin, id_ok ? GPIO_PIN_SET : GPIO_PIN_RESET);
-        HAL_GPIO_WritePin(LED_B_GPIO_Port, LED_B_Pin, GPIO_PIN_RESET);
+        g_imu.Config();     // 软复位 -> 上电 -> 量程/带宽，内部累计约 445 ms
+        EnsureAccPowered(); // 再校验一次“上电/退出 suspend”是否真的写进去了（见上面的说明）
+
+        g_imu.Calibrate();  // 采样 4000 次求陀螺零偏，每次 sleep 1 tick，约阻塞 4 s
+                            // ！这几秒请让板子保持静止，否则 CALIBRATE_ERR 置位
+
+        /* 初始化流程走完了。老师给的 ID 校验只在失败时置 INIT_ERR、成功时不清它，
+         * 所以 INIT_ERR 会一直停在构造时的默认 true；由上层在流程成功后清掉。*/
+        if (!g_imu.self_test.ACC_CHIP_ID_ERR && !g_imu.self_test.GYRO_CHIP_ID_ERR)
+        {
+            g_imu.self_test.INIT_ERR = false;
+        }
     }
-#endif
 
     for (;;)
     {
+        g_imu.ReadAccData(&g_imu.acc_data);                    // m/s²
+        g_imu.ReadAccTemperature(&g_imu.acc_data.temperature); // ℃，填进 acc_data 的温度字段
+        g_imu.ReadGyroData(&g_imu.gyro_data);                  // rad/s
+        g_imu.VerifyAccData();
+        g_imu.VerifyGyroData();
+
+#if IMU_SELF_TEST_LED
+        ImuLedUpdate();
+#endif
+
         tx_thread_sleep(IMU_THREAD_TICK);
     }
 }

@@ -24,6 +24,20 @@ namespace BMI088
 
         /* 单次传输的字节上限：加速度计 burst 读要 1(哑字节) + 6(三轴) = 7，取 8 留余量。*/
         constexpr uint8_t BMI088_SPI_MAX_LEN = 8U;
+
+        /* 判断一段原始字节是否“通信失效”：MISO 断线/被短接到电源或地、总线被拉死时，
+         * SPI 读回的是恒定字（全 0x00 或全 0xFF），于是所有字节完全相同。
+         * 真实数据不会这样 —— 三轴各自独立，且各轴最低位一直在噪声里跳动，
+         * 连续 6 个字节（含 3 个 LSB）全同的概率极低。
+         * 用这个判据与板子姿态无关；若改用“|a| ≈ 9.8”判，做直线加速运动时会误报。*/
+        bool RawIsDead(const uint8_t *data, uint8_t n)
+        {
+            for (uint8_t i = 1U; i < n; ++i)
+            {
+                if (data[i] != data[0]) return false;
+            }
+            return true;
+        }
     }
 
     /**
@@ -124,12 +138,32 @@ namespace BMI088
 
     void cBMI088::VerifyAccData()
     {
-        // TODO: 检查加速度数据是否有效，并更新 ACC_DATA_ERR。
+        /* 重新取一次原始字节来判通信是否失效（与 ReadAccData 同一读协议：
+         * 加速度计地址后还有 1 个哑字节，故读 1+6 = 7 字节，rx+1 才是数据）。
+         * 独立读一次的好处是 Verify 不依赖 Read 是否刚跑过，可单独调用做通信自检。*/
+        uint8_t rx[ACC_XYZ_LEN + 1U];
+        ReadReg(BMI088_CS_ACC, ACC_X_LSB_ADDR, rx, ACC_XYZ_LEN + 1U);
+
+        const bool comm_dead = RawIsDead(rx + 1U, ACC_XYZ_LEN);
+        const bool not_finite = !(std::isfinite(acc_data.x) &&
+                                  std::isfinite(acc_data.y) &&
+                                  std::isfinite(acc_data.z));
+
+        self_test.ACC_DATA_ERR = comm_dead || not_finite;
     }
 
     void cBMI088::VerifyGyroData()
     {
-        // TODO: 检查角速度数据是否有效，并更新 GYRO_DATA_ERR。
+        /* 陀螺仪没有哑字节，数据从 rx[0] 起。*/
+        uint8_t rx[GYRO_XYZ_LEN];
+        ReadReg(BMI088_CS_GYRO, GYRO_RATE_X_LSB_ADDR, rx, GYRO_XYZ_LEN);
+
+        const bool comm_dead = RawIsDead(rx, GYRO_XYZ_LEN);
+        const bool not_finite = !(std::isfinite(gyro_data.x) &&
+                                  std::isfinite(gyro_data.y) &&
+                                  std::isfinite(gyro_data.z));
+
+        self_test.GYRO_DATA_ERR = comm_dead || not_finite;
     }
 
     void cBMI088::WriteReg(enum BMI088_SENSOR cs, uint8_t addr, uint8_t *data, uint8_t len)
@@ -255,22 +289,63 @@ namespace BMI088
 
     void cBMI088::ReadAccData(acc_data_t *data)
     {
-        // TODO: 按 BMI088 加速度计 SPI 协议丢弃首个无效字节，拼接三轴有符号原始值，
-        // 再按配置的量程换算为 m/s²，写入 data。
-        if (data != nullptr) *data = {};
+        if (data == nullptr) return;
+
+        /* 三轴 burst 读：加速度计在地址之后先送 1 个哑字节，随后依次是
+         * X_LSB,X_MSB,Y_LSB,Y_MSB,Z_LSB,Z_MSB —— 共 1+6 = 7 字节。
+         * 每轴“低字节在前”，按 (MSB<<8)|LSB 拼成有符号 16 位原始计数。*/
+        uint8_t rx[ACC_XYZ_LEN + 1U];
+        ReadReg(BMI088_CS_ACC, ACC_X_LSB_ADDR, rx, ACC_XYZ_LEN + 1U);
+
+        const int16_t raw_x = static_cast<int16_t>((static_cast<uint16_t>(rx[2]) << 8) | rx[1]);
+        const int16_t raw_y = static_cast<int16_t>((static_cast<uint16_t>(rx[4]) << 8) | rx[3]);
+        const int16_t raw_z = static_cast<int16_t>((static_cast<uint16_t>(rx[6]) << 8) | rx[5]);
+
+        /* 量纲：raw × IMU_ACCEL_6G_SEN = m/s²。
+         * 该常数就是“每 LSB 多少 m/s²”（6 g 满量程 / 32768 LSB，已把 g 折算进去），
+         * 所以结果直接是 m/s²，不需要再乘 9.8。随后扣掉预标定零偏（同为 m/s² 量纲）。*/
+        data->x = static_cast<float>(raw_x) * IMU_ACCEL_6G_SEN - BMI088_ACCEL_PRE_CALI_OFFSET_X;
+        data->y = static_cast<float>(raw_y) * IMU_ACCEL_6G_SEN - BMI088_ACCEL_PRE_CALI_OFFSET_Y;
+        data->z = static_cast<float>(raw_z) * IMU_ACCEL_6G_SEN - BMI088_ACCEL_PRE_CALI_OFFSET_Z;
     }
 
     void cBMI088::ReadGyroData(gyro_data_t *data)
     {
-        // TODO: 读取并拼接陀螺仪三轴原始值，按配置量程换算为 rad/s，
-        // 减去 Gyro_offset 后写入 data。
-        if (data != nullptr) *data = {};
+        if (data == nullptr) return;
+
+        /* 陀螺仪 burst 读**没有**哑字节（数据手册 §6.1.1），地址之后当场就是
+         * X_LSB,X_MSB,Y_LSB,Y_MSB,Z_LSB,Z_MSB，共 6 字节。*/
+        uint8_t rx[GYRO_XYZ_LEN];
+        ReadReg(BMI088_CS_GYRO, GYRO_RATE_X_LSB_ADDR, rx, GYRO_XYZ_LEN);
+
+        const int16_t raw_x = static_cast<int16_t>((static_cast<uint16_t>(rx[1]) << 8) | rx[0]);
+        const int16_t raw_y = static_cast<int16_t>((static_cast<uint16_t>(rx[3]) << 8) | rx[2]);
+        const int16_t raw_z = static_cast<int16_t>((static_cast<uint16_t>(rx[5]) << 8) | rx[4]);
+
+        /* 量纲：raw × IMU_GYRO_2000_SEN = rad/s。
+         * 该常数 = (2000 °/s ÷ 32768) × π/180，已含 deg→rad 换算，不用再乘 π/180。
+         * 再减掉 Calibrate() 标出的零偏（同为 rad/s）。若这次上电没标定过，
+         * Gyro_offset 的初值是头文件里的预标定常数，不会是野值。*/
+        data->x = static_cast<float>(raw_x) * IMU_GYRO_2000_SEN - Gyro_offset[0];
+        data->y = static_cast<float>(raw_y) * IMU_GYRO_2000_SEN - Gyro_offset[1];
+        data->z = static_cast<float>(raw_z) * IMU_GYRO_2000_SEN - Gyro_offset[2];
     }
 
     void cBMI088::ReadAccTemperature(float *temp)
     {
-        // TODO: 丢弃加速度计读取时的首个无效字节，解析 11 位有符号温度并换算为摄氏度。
-        if (temp != nullptr) *temp = 0.0f;
+        if (temp == nullptr) return;
+
+        /* 温度寄存器 0x22(MSB)/0x23(LSB) 走的仍是加速度计接口，所以同样有 1 个哑字节：
+         * 读 1+2 = 3 字节。有效值是 11 位有符号、左对齐 —— 把 MSB 与 LSB 的高 3 位
+         * 拼成 16 位后算术右移 5 位，得到 11 位计数（可为负）。
+         * 换算：count × 0.125 ℃ + 23 ℃。*/
+        uint8_t rx[TEMP_LEN + 1U];
+        ReadReg(BMI088_CS_ACC, TEMP_MSB_ADDR, rx, TEMP_LEN + 1U);
+
+        const int16_t raw = static_cast<int16_t>(
+            (static_cast<uint16_t>(rx[1]) << 8) | (rx[2] & 0xE0U));
+
+        *temp = static_cast<float>(raw >> 5) * TEMP_UNIT + TEMP_BIAS;
     }
 
 }

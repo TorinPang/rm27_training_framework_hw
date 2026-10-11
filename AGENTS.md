@@ -230,11 +230,11 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 | 3 | `bsp/src/bsp_usart.cpp` | 双串口 DMA+空闲中断、启动接收、按 mode 发送 | A | **代码完成**；接收/发送未验（**无串口线**，见 §3.3） |
 | 4 | `bsp/src/bsp_can.cpp` | `CAN_Transmit` 组帧发送；接收回调取帧并上交上层（弱符号 `CAN_RxCallback`） | B | **代码完成，待上板验证** |
 | 5 | `modules/include/BMI088.hpp:21` | SPI 句柄 + ACC/GYRO 片选宏 | C | **代码完成，已上板验证** |
-| 6 | `modules/src/BMI088.cpp:63,106,111,116,126,208,215,222` | 温控占空比、数据校验、寄存器读写、三轴/温度解析 | C | **部分完成**（`WriteReg`/`ReadReg` 完成并上板验证；三轴/温度解析、`Verify*Data` 待做） |
+| 6 | `modules/src/BMI088.cpp:84` | 温控占空比（属方向 D）、数据校验、寄存器读写、三轴/温度解析 | C | **除温控外全部完成**（`WriteReg`/`ReadReg`、三轴/温度解析、`Verify*Data` 均已上板验证） |
 | 7 | `modules/src/M2006.cpp` | 构造参数、松开/速度/位置双环、`maxCurrent` 限幅、离线保护、`AliveCheck` | B | **代码完成，待上板整定**（PID 增益为起步值） |
 | 8 | `modules/include/DJIMotor.hpp:65,66` | 速度环/位置环 PID 参数 | B | **代码完成，待上板整定** |
 | 9 | `modules/src/DJIMotorHandler.cpp` | 注册(0x201~0x208)、0x200/0x1FF 存在标志、组帧大端序、反馈解析+编码器回绕+减速比换算、存活检查；并实现强符号 `CAN_RxCallback` | B | **代码完成，待上板验证** |
-| 10 | `threads/src/controlthread.cpp`、`threads/src/imuthread.cpp`、`threads/include/threads.hpp`、`Core/Src/app_threadx.c` | **control / imu 线程已完成**（control 1 ms、imu 100 ms，均静态栈）；alive 线程待做。创建位置由 `main.c` 修正为 `app_threadx.c` | A~E | **部分完成**（imu 的 ID 自检已上板验证；alive 待做） |
+| 10 | `threads/src/controlthread.cpp`、`threads/src/imuthread.cpp`、`threads/include/threads.hpp`、`Core/Src/app_threadx.c` | **control / imu 线程已完成**（均为 1 ms 周期、静态栈）；alive 线程待做。创建位置由 `main.c` 修正为 `app_threadx.c` | A~E | **部分完成**（imu 的初始化 + 三轴/温度读数已上板验证；alive 待做） |
 | 11 | LED 模块 | 自行封装 GPIO（`bsp/` 下新增），供 alive 线程做灯效 | E | 待做 |
 
 ### 3.3 上板验证清单
@@ -274,10 +274,11 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - [x] C · **芯片 ID**：ACC `0x1E` / GYRO `0x0F` 读回正确（2026-10-11 已验，连测两次上电一致）
 - [x] C · **读数用法**：`ReadReg` 返回流中 ACC 的 ID 在 `[1]`（前有 1 个哑字节）、GYRO 在 `[0]` —— 已用原始字节取证
 - [x] C · **片选归属**：PA4 = 加速度计、PB0 = 陀螺仪 —— 已用 ID 数据证实
-- [x] C · **imu 线程在跑**：`run_count` 100 ms/轮、逻辑跑在优先级 10、栈水位 347/1024 B
-- [ ] C · 三轴单位：静止时 `|a| ≈ 9.8 m/s²`、角速度 ≈ 0、温度 ≈ 室温（需步骤 2 的解析）
-- [ ] C · `Config()`/`Calibrate()` 接入线程并复验 ID 与数据（注意 `Calibrate()` 采样 4000 次 ≈ 阻塞 4 s）
-- [ ] C · 通信失败：短接/断开 MISO 时 `*_DATA_ERR` 能置位
+- [x] C · **imu 线程在跑**：`run_count` 1 ms/轮、逻辑跑在优先级 10、栈水位 483/1024 B
+- [x] C · **三轴单位**：静止时 `|a| = 9.79 / 9.74 m/s²`（两次上电）、角速度 ≈ 0（~1e-3 rad/s）、温度 24.75 ℃
+- [x] C · **`Config()`/`Calibrate()` 接入线程**：初始化后 ID 与数据复验通过；`Calibrate()` 采样 4000 次 ≈ 阻塞 4 s（上电后需静置）
+- [x] C · **加速度计上电坑**：`Config()` 里那次 `ACC_PWR_CTRL=0x04` 实测不生效（读回 0x00、数据恒 0），已用"写+回读校验+重试"（`EnsureAccPowered()`）修掉；两次上电均稳定
+- [ ] C · 通信失败：短接/断开 MISO 时 `*_DATA_ERR` 能置位 —— 代码就绪（判据=6 字节原始值全同），需手工动线复现
 - [ ] C · 数据共享：把 `g_imu` 的数据交给其它线程的出口（单写者约定，如需再加互斥）
 
 ---
