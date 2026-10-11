@@ -54,11 +54,14 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${ROOT}/bsp/src/bsp.cpp
     ${ROOT}/bsp/src/bsp_usart.cpp
     ${ROOT}/bsp/src/bsp_can.cpp
+    ${ROOT}/bsp/src/bsp_pwm.cpp   # BMI088.cpp 的 vtable 会牵到 TemperatureControl -> PWM_SetDutyRatio
     ${ROOT}/libs/src/math.cpp
     ${ROOT}/libs/src/pid.cpp
     ${ROOT}/modules/src/DJIMotorHandler.cpp
     ${ROOT}/modules/src/M2006.cpp
+    ${ROOT}/modules/src/BMI088.cpp
     ${ROOT}/threads/src/controlthread.cpp
+    ${ROOT}/threads/src/imuthread.cpp
 )
 
 # Add include paths

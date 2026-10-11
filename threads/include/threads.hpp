@@ -16,6 +16,13 @@ extern "C" {
  */
 void ControlThread_Init(void);
 
+/**
+ * @brief 创建并启动 imu 线程（方向 C / TODO #10）。
+ * @note 与 ControlThread_Init 相同：必须在 tx_application_define() 的调用链内调用，
+ *       线程用静态栈，不占用 CubeMX 的 byte pool。
+ */
+void ImuThread_Init(void);
+
 #ifdef __cplusplus
 }
 #endif

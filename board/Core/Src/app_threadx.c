@@ -67,6 +67,7 @@ UINT App_ThreadX_Init(VOID *memory_ptr)
   /* 创建应用线程。线程必须在两处之一创建：tx_application_define() 的调用链内，
    * 或已运行的线程里；本工程走前者（App_ThreadX_Init 由 tx_application_define 调用）。 */
   ControlThread_Init(); /* 方向 B：control 线程，1 ms 周期跑电机控制 */
+  ImuThread_Init();     /* 方向 C：imu 线程，BMI088 初始化 / 读三轴与温度 */
   /* USER CODE END App_ThreadX_Init */
 
   return ret;

@@ -29,6 +29,8 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 ```
 
 - **HAL 调用只能出现在 `bsp/`**（LED、IMU 例外：README 允许直接调 HAL GPIO/SPI）。`modules/` 及以上不得直接包含 `stm32f4xx_hal*.h`。
+  - 实践（2026-10-11，方向 C）：`modules/include/BMI088.hpp` 直接 `#include "spi.h"`（该头自带 `main.h`，于是 `hspi1` 与 `CS_Accel/CS_Gyro` 引脚宏一次拿全），这正是上述"IMU 例外"；
+    `modules/` 的其余文件仍不得自行 include HAL 头。
 - **CubeMX 重新生成会覆盖 `board/Core/`**：自己的代码永远写在 `bsp/ libs/ modules/ threads/`，或 `board/` 内的 `USER CODE BEGIN/END` 区。
 - 分层已有目录结构（`include/` + `src/`），新增文件**沿用**，不要另起目录。
 - 每个功能必须有**开关**（宏或线程是否启动），保证能单独验证。
@@ -190,6 +192,35 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - 注：`_tx_thread_current_ptr` 读到 0 是**正常**的 —— Cortex-M port 在调度器里刻意置 NULL
   （`tx_thread_schedule.S`），当前线程由 `_tx_thread_execute_ptr` + PSP 跟踪。
 
+**2026-10-11 · 方向 C 步骤 1：BMI088 SPI 读通路（TODO #5、#6 的读写部分）代码完成并上板验证**
+
+- `modules/include/BMI088.hpp`（TODO #5）：`#include "spi.h"`（该头自带 `main.h`）+ 4 个宏 ——
+  `BMI088_SPI_HANDLE = hspi1`、`BMI088_ACC_CS_GPIO_PORT/PIN = CS_Accel_*`（PA4）、
+  `BMI088_GYRO_CS_GPIO_PORT/PIN = CS_Gyro_*`（PB0）；两个 User Label 由本人在 CubeMX 里加好、`main.h` 生成。
+- `modules/src/BMI088.cpp`（TODO #6 的 `WriteReg`/`ReadReg`）：两段式实现（发地址 → 收发数据），CS 软件控制，
+  SPI 时序参数沿用 CubeMX 的 Mode3 / 8bit / MSB / 预分频 16；文件内匿名命名空间放片选映射、10 ms 超时、8 字节长度上限。
+  - **哑字节口径（关键）**：`ReadReg` **不替调用方丢弃哑字节** —— 返回流第 0 位是"发地址期间的无效字节"，其后才开始计数。
+    于是加速度计 ID 落在 `[1]`（数据手册 §6.1.2：地址之后还多 1 个哑字节），陀螺仪 ID 落在 `[0]`（§6.1.1：无哑字节）——
+    这与老师已给的 `VerifyAccChipID`（读 2 取 `[1]`）/`VerifyGyroChipID`（读 1 取 `[0]`）**完全自洽，既有代码一行未改**。
+- `board/CMakeLists.txt`：`target_sources` 加 `modules/src/BMI088.cpp`、`threads/src/imuthread.cpp`，
+  以及 **`bsp/src/bsp_pwm.cpp`**（★非直觉依赖：`cBMI088` 带虚函数，一旦构造对象整张 vtable 被引用 →
+  `TemperatureControl` 进固件 → 它调用 `PWM_SetDutyRatio`；`bsp_pwm.cpp` 保持 TODO 空桩即可，不越界到方向 D）。
+- 新建 `threads/src/imuthread.cpp`（imu 线程骨架，C1 只做 ID 自检）：静态栈 1024 B(`aligned(8)`)、优先级 10、
+  `TX_NO_TIME_SLICE`、`TX_AUTO_START`，循环 `tx_thread_sleep(100)` = 100 ms；`BMI088::cBMI088 g_imu` 放**全局存储**
+  （故意不加 static → 符号名就是 `g_imu`，SWD 一查就有）。`threads.hpp` 加 `ImuThread_Init()`，
+  `app_threadx.c` 的 `App_ThreadX_Init` 里在 `ControlThread_Init()` 之后调用。
+- 验证：① 编译 `exit=0`、无告警；RAM 7456 → **8768 B**（+1312 = 栈 1024 + `TX_THREAD` 176 + `g_imu` 112，与 `nm` 尺寸逐项吻合）、
+  FLASH 39612 → **44008 B**。② 烧写 `Verified OK`（`device id = 0x10076413`）。
+  ③ **SWD 读内存**：`g_imu.self_test`（对象 +32）两个 ID 错误标志**均为 0**；`GPIOH->ODR = 0x800` → **绿灯亮**；
+  **连续两次上电（烧写后、`reset run` 后）结果一致**。
+  ④ 原始返回流取证：ACC = `23 1E 23 00 10 …`（`[1]=0x1E`）、GYRO = `0F 22 …`（`[0]=0x0F`）
+  → 两只芯片 ID 都读对，并**用数据证实片选归属：PA4=加速度计、PB0=陀螺仪**（不再是"按原理图猜"）。
+  ⑤ `imu_thread`：`'THRD'`、priority 10、`state=TX_SLEEP`；`run_count` 1.5 s 内 +15（= **100 ms/轮**）；栈水位 **347/1024 B**。
+- **本轮唯一异常（已定位并做防御）**：重置后**第一次** SPI 事务（加速度计首次读）出现过一次失败，此后每次访问都正常。
+  未硬猜机制，采取"先 `tx_thread_sleep(10)` 稳定 + 丢弃一次热身读 + 校验失败再重读一轮"，之后 2/2 次上电稳定通过。
+- 未做（C 后续）：`ReadAccData`/`ReadGyroData`/`ReadAccTemperature`/`Verify*Data`（步骤 2）、
+  `Config()`/`Calibrate()` 接入与数据共享出口（步骤 3）；`TemperatureControl` + `bsp_pwm.cpp` 属方向 D。
+
 ### 3.2 待补 TODO（唯一权威清单）
 
 | # | 文件:行 | 内容 | 所属方向 | 状态 |
@@ -198,12 +229,12 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 | 2 | `bsp/src/bsp_pwm.cpp:9,14,19,24,29` | PWM 初始化/启停/周期(秒→ARR)/占空比([0,1]→CCR) | B·C | 待做 |
 | 3 | `bsp/src/bsp_usart.cpp` | 双串口 DMA+空闲中断、启动接收、按 mode 发送 | A | **代码完成**；接收/发送未验（**无串口线**，见 §3.3） |
 | 4 | `bsp/src/bsp_can.cpp` | `CAN_Transmit` 组帧发送；接收回调取帧并上交上层（弱符号 `CAN_RxCallback`） | B | **代码完成，待上板验证** |
-| 5 | `modules/include/BMI088.hpp:21` | SPI 句柄 + ACC/GYRO 片选宏 | C | 待做 |
-| 6 | `modules/src/BMI088.cpp:63,106,111,116,126,208,215,222` | 温控占空比、数据校验、寄存器读写、三轴/温度解析 | C | 待做 |
+| 5 | `modules/include/BMI088.hpp:21` | SPI 句柄 + ACC/GYRO 片选宏 | C | **代码完成，已上板验证** |
+| 6 | `modules/src/BMI088.cpp:63,106,111,116,126,208,215,222` | 温控占空比、数据校验、寄存器读写、三轴/温度解析 | C | **部分完成**（`WriteReg`/`ReadReg` 完成并上板验证；三轴/温度解析、`Verify*Data` 待做） |
 | 7 | `modules/src/M2006.cpp` | 构造参数、松开/速度/位置双环、`maxCurrent` 限幅、离线保护、`AliveCheck` | B | **代码完成，待上板整定**（PID 增益为起步值） |
 | 8 | `modules/include/DJIMotor.hpp:65,66` | 速度环/位置环 PID 参数 | B | **代码完成，待上板整定** |
 | 9 | `modules/src/DJIMotorHandler.cpp` | 注册(0x201~0x208)、0x200/0x1FF 存在标志、组帧大端序、反馈解析+编码器回绕+减速比换算、存活检查；并实现强符号 `CAN_RxCallback` | B | **代码完成，待上板验证** |
-| 10 | `threads/src/controlthread.cpp`、`threads/include/threads.hpp`、`Core/Src/app_threadx.c` | **control 线程已完成**（1 ms、静态栈、优先级 8）；alive / imu 线程待做。创建位置由 `main.c` 修正为 `app_threadx.c` | A~E | **部分完成**（control 代码完成，待上板） |
+| 10 | `threads/src/controlthread.cpp`、`threads/src/imuthread.cpp`、`threads/include/threads.hpp`、`Core/Src/app_threadx.c` | **control / imu 线程已完成**（control 1 ms、imu 100 ms，均静态栈）；alive 线程待做。创建位置由 `main.c` 修正为 `app_threadx.c` | A~E | **部分完成**（imu 的 ID 自检已上板验证；alive 待做） |
 | 11 | LED 模块 | 自行封装 GPIO（`bsp/` 下新增），供 alive 线程做灯效 | E | 待做 |
 
 ### 3.3 上板验证清单
@@ -237,6 +268,17 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - [ ] B · 速度环跟随：给 `speedSet` 阶跃，看 `speedFdb` 收敛、无持续振荡（**PID 需先整定**）
 - [ ] B · 双环位置：`positionSet` 到位后停住、超调可接受（注意 `positionFdb` 无绝对零点，需先归零）
 - [ ] B · 离线检测：拔 CAN，`AliveCheck` 应在下一周期转 OFFLINE 且 `currentSet` 归 0
+
+**待做 · C · BMI088（无需任何外部硬件，板载即可验 —— 这是 C 比 B 好做的地方）**
+
+- [x] C · **芯片 ID**：ACC `0x1E` / GYRO `0x0F` 读回正确（2026-10-11 已验，连测两次上电一致）
+- [x] C · **读数用法**：`ReadReg` 返回流中 ACC 的 ID 在 `[1]`（前有 1 个哑字节）、GYRO 在 `[0]` —— 已用原始字节取证
+- [x] C · **片选归属**：PA4 = 加速度计、PB0 = 陀螺仪 —— 已用 ID 数据证实
+- [x] C · **imu 线程在跑**：`run_count` 100 ms/轮、逻辑跑在优先级 10、栈水位 347/1024 B
+- [ ] C · 三轴单位：静止时 `|a| ≈ 9.8 m/s²`、角速度 ≈ 0、温度 ≈ 室温（需步骤 2 的解析）
+- [ ] C · `Config()`/`Calibrate()` 接入线程并复验 ID 与数据（注意 `Calibrate()` 采样 4000 次 ≈ 阻塞 4 s）
+- [ ] C · 通信失败：短接/断开 MISO 时 `*_DATA_ERR` 能置位
+- [ ] C · 数据共享：把 `g_imu` 的数据交给其它线程的出口（单写者约定，如需再加互斥）
 
 ---
 

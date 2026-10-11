@@ -121,3 +121,64 @@
   以及"手动转输出轴一圈"确认编码器 8192 vs 8191。
 - `CONTROL_TEST_MODE` 保持 **0（RELAX）**，最安全；整定 PID 时再改 1/2。
 - 串口三条仍挂起（无串口线）。
+
+---
+
+## 2026-10-11 · 方向 C 步骤 1：BMI088 的 SPI 读通路（读芯片 ID）
+
+**目标**：写完 BMI088 的寄存器读写封装（TODO #5 + #6 的 `WriteReg`/`ReadReg`），并按"一次只让一条方向亮"的节奏
+**只验读通路** —— 读两只芯片的 ID，不碰任何寄存器。这样万一不过，就能确定是 SPI 模式/引脚/片选的问题，与写通路无关。
+手上没有串口线，所以验证靠 **SWD 读内存 + 三色灯**。
+
+**现象（起点）**：SPI1 已由 CubeMX 配好（PB3/PB4/PA7、Mode3、预分频 /16 = 5.25 Mbit/s、软件 NSS），
+PA4/PB0 作为两组片选输出且初始为高；`VerifyAccChipID()`/`VerifyGyroChipID()` 是老师已给的，就等 `ReadReg` 落地。
+
+**猜想**：
+
+1. 这个方向最大的不确定不是引脚，而是**读协议里那个"哑字节"算在哪一位**：数据手册 §6.1.2 说加速度计在地址之后
+   **还会多送 1 个哑字节**（单字节读要按 burst 读 2 字节、丢弃第 1 个），§6.1.1 说陀螺仪**没有**哑字节。
+2. 老师已给的 `VerifyAccChipID`（读 2 字节取 `[1]`）与 `VerifyGyroChipID`（读 1 字节取 `[0]`）反过来给出了口径：
+   `ReadReg` 应当**按原样回传地址之后的 len 字节、不替调用方丢弃**，否则两处既有代码就会读错位。
+3. 没有串口线也能验：`TX_THREAD` 与全局对象都是普通 RAM 变量，SWD 直接读即可（本项目第二次上板已经这么干过）；
+   灯效则当作第一眼的判据。
+
+**改动**：
+
+- `modules/include/BMI088.hpp`：`#include "spi.h"`（自带 `main.h`）+ 4 个宏：`BMI088_SPI_HANDLE = hspi1`、
+  `BMI088_ACC_CS_*`（PA4）、`BMI088_GYRO_CS_*`（PB0）。
+- `modules/src/BMI088.cpp`：`WriteReg`（地址与 `0x7F` 相与清掉读标志位 → 数据）与 `ReadReg`
+  （发 `addr|0x80` → 一次 `HAL_SPI_TransmitReceive` 收发 `len+1` 字节 → 只取后 `len` 字节；失败清零）。
+- `board/CMakeLists.txt`：加 `modules/src/BMI088.cpp`、`threads/src/imuthread.cpp`，
+  以及 **`bsp/src/bsp_pwm.cpp`** —— 这一条不直观：`cBMI088` 有虚函数，一旦构造对象整张 vtable 被引用，
+  `TemperatureControl` 就进固件、进而需要 `PWM_SetDutyRatio`（PWM 本身属方向 D，这里只是个空桩）。
+- 新建 `threads/src/imuthread.cpp`：最小 imu 线程（静态栈 1024 B、优先级 10、100 ms 周期），
+  只做"ID 自检 + 灯效"；`g_imu` 放全局存储以便 SWD 按符号读。`threads.hpp` 加 `ImuThread_Init()`，
+  `app_threadx.c` 里在 `ControlThread_Init()` 之后调用。
+
+**结果**：
+
+| 项 | 实测 | 判读 |
+|---|---|---|
+| 编译 | `exit=0`、无告警；RAM 7456 → **8768 B**、FLASH 39612 → **44008 B** | RAM 增量 1312 = 栈 1024 + `TX_THREAD` 176 + `g_imu` 112，与 `nm` 尺寸逐项吻合 |
+| 烧写 | `Verified OK`、`device id = 0x10076413` | 烧写链正常 |
+| 第一次上板 | **红灯亮**；`self_test`：`ACC_CHIP_ID_ERR = 1`、`GYRO_CHIP_ID_ERR = 0` | **陀螺仪通了、加速度计没通** → 总线/模式/片选/引脚都没问题 |
+| 原始字节取证 | ACC = `23 1E 23 00 10 …`、GYRO = `0F 22 xx …` | ACC 的 ID 在 `[1]`、GYRO 的 ID 在 `[0]`；**顺带用数据证实 PA4=加速度计、PB0=陀螺仪** |
+| 第二轮上板（加 `tx_thread_sleep(10)` + 3 轮连读） | 三轮 ACC 全为 `[1]=0x1E`、GYRO 全为 `[0]=0x0F`；`self_test` 两个标志归 0 | 失败**只发生在重置后的第一次访问**，之后每次都正常（第 1 轮哑字节位是 `0x23`、后两轮是 `0x00`） |
+| 定稿版连续两次上电 | `self_test` = `00 01 00 01`（两标志均 0）、`GPIOH->ODR = 0x800` | **绿灯亮，2/2 次一致** |
+| `imu_thread` | `'THRD'`、priority 10、`state = TX_SLEEP`；`run_count` 1.5 s 内 +15；栈水位 347/1024 B | 100 ms/轮，余量充足 |
+
+**结论**：
+
+1. **读通路成立**：两只芯片 ID 都读对，且取字节的位置与老师既有的两个 `Verify*ChipID` 完全自洽（既有代码一行未改）。
+2. **片选归属不再是"按原理图猜"**：PA4 读到 `0x1E`、PB0 读到 `0x0F`，用数据钉死了。
+3. 唯一异常是**重置后第一次 SPI 事务不可靠**（加速度计侧）。只有 1 个失败样本，所以机制**没有**下结论；
+   采取的是防御式处理：先 `tx_thread_sleep(10)` 等稳定 → 丢弃一次热身读 → 校验失败再重读一轮。
+   定稿后连续两次上电稳定通过。若以后再复现，应优先怀疑"首次事务的 CS/SCK 建立时序"而不是协议取位。
+
+**遗留 / 下一步（C 的后续步骤）**：
+
+- 步骤 2：`ReadAccData`/`ReadGyroData`/`ReadAccTemperature` 的拼接与单位换算（`m/s²`、`rad/s`、`℃`），
+  `Verify*Data` 用"全 0 / 全 0xFF / NaN"判通信失效，并拔线复现一次。
+- 步骤 3：把 `Config()`/`Calibrate()` 接进 imu 线程（注意 `Calibrate()` 采样 4000 次 ≈ 阻塞 4 s），
+  并留出给其它线程读数据的出口。
+- `TemperatureControl` + `bsp_pwm.cpp` 的实质实现属方向 D，本轮只是让 `bsp_pwm.cpp` 进工程以解链接依赖。

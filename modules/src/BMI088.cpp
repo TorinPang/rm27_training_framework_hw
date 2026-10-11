@@ -5,6 +5,27 @@
 
 namespace BMI088
 {
+    namespace
+    {
+        /* 片选映射：把 cs 枚举翻成 CubeMX 生成的引脚宏（见 BMI088.hpp 的硬件连接一节）。
+         * 两只从设备共用总线但片选独立，任何时刻只能有一个 CS 为低。*/
+        GPIO_TypeDef *CsPort(enum BMI088_SENSOR cs)
+        {
+            return (cs == BMI088_CS_ACC) ? BMI088_ACC_CS_GPIO_PORT : BMI088_GYRO_CS_GPIO_PORT;
+        }
+
+        uint16_t CsPin(enum BMI088_SENSOR cs)
+        {
+            return (cs == BMI088_CS_ACC) ? BMI088_ACC_CS_PIN : BMI088_GYRO_CS_PIN;
+        }
+
+        /* 单次 SPI 事务的超时（ms）。5.25 Mbit/s 下 8 个字节不到 15 µs，10 ms 已很宽松。*/
+        constexpr uint32_t BMI088_SPI_TIMEOUT = 10U;
+
+        /* 单次传输的字节上限：加速度计 burst 读要 1(哑字节) + 6(三轴) = 7，取 8 留余量。*/
+        constexpr uint8_t BMI088_SPI_MAX_LEN = 8U;
+    }
+
     /**
      * @brief BMI088 acc gyro 标定
      * @note 标定后的陀螺仪零偏存储在 Gyro_offset 中。
@@ -113,23 +134,52 @@ namespace BMI088
 
     void cBMI088::WriteReg(enum BMI088_SENSOR cs, uint8_t addr, uint8_t *data, uint8_t len)
     {
-        // TODO: 根据 cs 拉低对应 GPIO 片选；按 SPI 写协议发送地址和数据，
-        // 最后释放片选，并处理通信失败与必要的延时。
-        (void)cs;
-        (void)addr;
-        (void)data;
-        (void)len;
+        if (data == nullptr || len == 0U || len > BMI088_SPI_MAX_LEN) return;
+
+        /* 写协议：先发 1 字节地址（bit0=0 表示写、bit1~7 为寄存器地址），随后紧跟 len 字节数据。
+         * 地址把最高位清掉 —— BMI088_SPI_WRITE_CODE(0x7F) 就是干这个的掩码。*/
+        uint8_t tx_addr = static_cast<uint8_t>(addr & BMI088_SPI_WRITE_CODE);
+
+        HAL_GPIO_WritePin(CsPort(cs), CsPin(cs), GPIO_PIN_RESET);
+        if (HAL_SPI_Transmit(&BMI088_SPI_HANDLE, &tx_addr, 1U, BMI088_SPI_TIMEOUT) == HAL_OK)
+        {
+            (void)HAL_SPI_Transmit(&BMI088_SPI_HANDLE, data, len, BMI088_SPI_TIMEOUT);
+        }
+        HAL_GPIO_WritePin(CsPort(cs), CsPin(cs), GPIO_PIN_SET);
     }
 
     void cBMI088::ReadReg(enum BMI088_SENSOR cs, uint8_t addr, uint8_t *data, uint8_t len)
     {
-        // TODO: 根据 cs 拉低对应 GPIO 片选；按 SPI 读协议发送地址，
-        // 丢弃加速度计返回的首个无效字节，读取 len 字节并释放片选。
-        // 未实现前清零缓冲区，避免芯片 ID 校验读取未初始化数据。
-        (void)cs;
-        (void)addr;
-        if (data != nullptr)
-            for (uint8_t i = 0; i < len; ++i) data[i] = 0;
+        if (data == nullptr || len == 0U || len > BMI088_SPI_MAX_LEN) return;
+
+        /* 读协议：先发 1 字节地址（bit7=1 表示读），之后的字节才是从机送回来的内容。
+         * 关键差别（数据手册 §6.1.2 / §6.1.1）：
+         *   - 加速度计在地址之后还会多送 1 个哑字节，第 2 个字节才是真数据
+         *     （"单字节读"要按 burst 读 2 字节、丢弃第 1 个）；
+         *   - 陀螺仪没有哑字节，地址之后当场就是数据。
+         * 所以这里按原样把 len 字节回传给调用方、不替它丢弃 —— 这样已经写好的
+         * VerifyAccChipID（读 2 取 [1]）与 VerifyGyroChipID（读 1 取 [0]）都能直接成立。*/
+        uint8_t tx[BMI088_SPI_MAX_LEN + 1U];
+        uint8_t rx[BMI088_SPI_MAX_LEN + 1U];
+
+        tx[0] = static_cast<uint8_t>(addr | BMI088_SPI_READ_CODE);
+        for (uint8_t i = 1U; i <= len; ++i) tx[i] = 0xFFU; // 读的时候 MOSI 上送什么是无所谓的
+
+        HAL_GPIO_WritePin(CsPort(cs), CsPin(cs), GPIO_PIN_RESET);
+        HAL_StatusTypeDef status = HAL_SPI_TransmitReceive(&BMI088_SPI_HANDLE,
+                                                           tx, rx,
+                                                           static_cast<uint16_t>(len) + 1U,
+                                                           BMI088_SPI_TIMEOUT);
+        HAL_GPIO_WritePin(CsPort(cs), CsPin(cs), GPIO_PIN_SET);
+
+        if (status == HAL_OK)
+        {
+            for (uint8_t i = 0U; i < len; ++i) data[i] = rx[i + 1U]; // rx[0] 是发地址期间的无效字节
+        }
+        else
+        {
+            for (uint8_t i = 0U; i < len; ++i) data[i] = 0U; // 通信失败清零，避免上级读到未初始化数据
+        }
     }
 
     void cBMI088::Config()

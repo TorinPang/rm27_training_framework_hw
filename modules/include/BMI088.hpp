@@ -2,6 +2,8 @@
 #define BMI088_HPP
 
 #include "IMU.hpp"
+#include "spi.h" //< 板级生成：spi.h 里已 include main.h，故 hspi1 与 CS_Accel/CS_Gyro 引脚宏一次拿全
+                 //< （README 允许 IMU 模块直接使用 HAL SPI/GPIO，这是 modules 层引 HAL 头的例外）
 
 namespace BMI088
 {
@@ -18,7 +20,15 @@ enum BMI088_SENSOR
 };
 
 /*---------------------------硬件连接---------------------------*/
-// TODO: 配置 BMI088 使用的 SPI 句柄，以及加速度计和陀螺仪各自的 GPIO 片选端口、引脚。
+// BMI088 挂在 SPI1 上：加速度计与陀螺仪共用 SCK/MISO/MOSI（PB3/PB4/PA7），靠各自独立的片选区分。
+// SPI 的时序参数（Mode3、8bit、MSB first、预分频 /16）在 board/Core/Src/spi.c 的 MX_SPI1_Init 里
+// 已经配好，这里只需要知道"用哪个句柄"和"拉低哪个片选"。
+#define BMI088_SPI_HANDLE hspi1 //< BMI088 使用的 SPI 句柄
+
+#define BMI088_ACC_CS_GPIO_PORT CS_Accel_GPIO_Port //< 加速度计片选端口（PA4）
+#define BMI088_ACC_CS_PIN CS_Accel_Pin             //< 加速度计片选引脚
+#define BMI088_GYRO_CS_GPIO_PORT CS_Gyro_GPIO_Port //< 陀螺仪片选端口（PB0）
+#define BMI088_GYRO_CS_PIN CS_Gyro_Pin             //< 陀螺仪片选引脚
 
 #define HEATING_RESISTANCE_TIM htim10            //< 加热电阻定时器
 #define HEATING_RESISTANCE_CHANNEL TIM_CHANNEL_1 //< 加热电阻通道
