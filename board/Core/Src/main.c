@@ -30,6 +30,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "bsp.hpp"
+#include <stdio.h> /* printf 的底层出口被重定向到 USART1，见 bsp/src/bsp_usart.cpp 的 __io_putchar */
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -39,7 +40,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* 上板自检开关：1 = 开机闪一下三色灯 + 从 USART1 打印，用于验证工程/工具链/调试通道；
+ * 自检完可以置 0（代码保留，但不再执行）。详见 AGENTS.md §3.3 待上板验证清单。 */
+#define BSP_SELF_TEST 1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -104,6 +107,20 @@ int main(void)
   MX_TIM10_Init();
   /* USER CODE BEGIN 2 */
   bsp_Init();
+
+#if BSP_SELF_TEST
+  /* 自检 1：三色灯（PH12/PH11/PH10，高电平点亮）亮 0.5s 再灭。
+   * 不需要任何外接设备，用肉眼即可确认"时钟、烧写、运行"三件事都正常。 */
+  HAL_GPIO_WritePin(GPIOH, LED_R_Pin | LED_G_Pin | LED_B_Pin, GPIO_PIN_SET);
+  HAL_Delay(500);
+  HAL_GPIO_WritePin(GPIOH, LED_R_Pin | LED_G_Pin | LED_B_Pin, GPIO_PIN_RESET);
+
+  /* 自检 2：调试串口。USART1 = PA9(TX)/PB7(RX)，串口助手 115200 8N1。
+   * 此时还没进 ThreadX（MX_ThreadX_Init 在后面），所以阻塞发送、HAL_Delay 都可以放心用。 */
+  printf("\r\n[rm27] boot ok\r\n");
+  printf("[rm27] sysclk = %lu Hz, tick = %lu ms\r\n",
+         (unsigned long)HAL_RCC_GetHCLKFreq(), (unsigned long)HAL_GetTick());
+#endif
   /* USER CODE END 2 */
 
   MX_ThreadX_Init();

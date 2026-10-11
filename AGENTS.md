@@ -108,13 +108,28 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - 口径提醒：`motorFeedback.currentFdb` 目前存**原始计数值**（与参考工程一致），未换算成 A。
 - 未做（B 后续）：`M2006.cpp` + `DJIMotor.hpp` PID 参数（步骤 3）、`control` 线程（步骤 4）。
 
+**2026-10-11 · 首次上板：烧写 + 运行自检通过（方向 A 部分验收）**
+
+- 工具链链路打通：`openocd 0.12.0`（`D:\ToolChain\OpenOCD\bin\openocd.exe`，在 PATH 上）；
+  ST-Link 在线（`STLINK V2J46M32`、目标电压 3.256 V、Cortex-M4 r0p1 识别正常）。
+- 烧写：`openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "program board/build/Debug/board.elf verify reset exit"`
+  → `device id = 0x10076413`（STM32F407IG / Flash 1024 KiB）→ **Programming Finished → Verified OK → Resetting Target**，`exit=0`。
+- `board/Core/Src/main.c`：新增**带开关的上板自检**（`USER CODE BEGIN PD` 的 `#define BSP_SELF_TEST 1`）——
+  三色灯（PH12/PH11/PH10，高电平亮）亮 500 ms 再灭；再经 USART1 打印 `[rm27] boot ok` + sysclk + tick。
+  放在 `MX_ThreadX_Init()` 之前，故阻塞发送与 `HAL_Delay` 均安全。
+- 编译：RAM 5624 → **6056 B (4.62%)**、FLASH 29860 → **35660 B (3.40%)**（FLASH +5800 B = `printf` 整条链首次被活引用）。
+- **上板现象（用户回报）**：三色灯烧写复位后正常点亮 → **时钟 / 烧写 / 运行三者全通**。
+  （注：这是经自检代码直接驱动 GPIO 验证的；TODO #11 的独立 LED 模块仍未封装。）
+- **串口项未验收**：用户**手上没有串口线**，`[rm27] boot ok` 是否打印出来尚未确认 —— 方向 A 保持"部分验收"，
+  串口三条留在 §3.3 等有串口线后一次性跑完。
+
 ### 3.2 待补 TODO（唯一权威清单）
 
 | # | 文件:行 | 内容 | 所属方向 | 状态 |
 |---|---|---|---|---|
 | 1 | `libs/src/pid.cpp` | 位置式/增量式 + 积分限幅 `maxIOut` + 输出限幅 `maxOut` | 地基 | **代码完成**（编译 + 数值验证；纯算法，无需上板） |
 | 2 | `bsp/src/bsp_pwm.cpp:9,14,19,24,29` | PWM 初始化/启停/周期(秒→ARR)/占空比([0,1]→CCR) | B·C | 待做 |
-| 3 | `bsp/src/bsp_usart.cpp` | 双串口 DMA+空闲中断、启动接收、按 mode 发送 | A | **代码完成，待上板验证** |
+| 3 | `bsp/src/bsp_usart.cpp` | 双串口 DMA+空闲中断、启动接收、按 mode 发送 | A | **代码完成**；接收/发送未验（**无串口线**，见 §3.3） |
 | 4 | `bsp/src/bsp_can.cpp` | `CAN_Transmit` 组帧发送；接收回调取帧并上交上层（弱符号 `CAN_RxCallback`） | B | **代码完成，待上板验证** |
 | 5 | `modules/include/BMI088.hpp:21` | SPI 句柄 + ACC/GYRO 片选宏 | C | 待做 |
 | 6 | `modules/src/BMI088.cpp:63,106,111,116,126,208,215,222` | 温控占空比、数据校验、寄存器读写、三轴/温度解析 | C | 待做 |
@@ -124,12 +139,22 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 | 10 | `threads/*`（空） | alive / imu / control 三个线程 + `main.c` 创建 | A~E | 待做 |
 | 11 | LED 模块 | 自行封装 GPIO（`bsp/` 下新增），供 alive 线程做灯效 | E | 待做 |
 
-### 3.3 待上板验证清单（缺硬件期间只累积，有板后一次性跑完）
+### 3.3 上板验证清单
 
-- [ ] A · USART1 打印：串口助手连 PA9/PB7、**115200 / 8N1**，能看到 `printf` 输出
+**已完成**
+
+- [x] **烧写 + 运行自检**（2026-10-11）：`program … verify` → `Verified OK`；复位后三色灯齐亮 500 ms 再灭
+      → 时钟 / 烧写 / 运行全通。（`BSP_SELF_TEST` 开关留在 `main.c`，改 0 即不再执行、代码保留。）
+
+**待做 · A · 串口 —— 当前阻塞：手上没有串口线**
+
+- [ ] A · USART1 打印：串口助手连 PA9/PB7、**115200 / 8N1**，能看到 `[rm27] boot ok`（自检已在代码里，接线即可验）
 - [ ] A · USART6 收发：与裁判系统口一致（PG14/PG9）
 - [ ] A · USART 接收链路：发数据触发 `USART_RxCallback`（临时做回环：收什么回什么），验证增量+回绕算法
-- [ ] B · CAN 发送：RELAX 模式下用 CAN 分析仪确认 0x200/0x1FF 报文 ID 与 8 字节大端序，电流为 0
+
+**待做 · B · CAN（需电机 + CAN 分析仪/上位机）**
+
+- [ ] B · CAN 发送：RELAX 模式下确认 0x200/0x1FF 报文 ID 与 8 字节大端序，电流为 0
 - [ ] B · CAN 接收：电机上电后能收到 0x201~0x208 反馈，`CAN_RxCallback` 被触发（先用打印肉眼确认）
 - [ ] B · 反馈解析：转轴看 `positionFdb`/`speedFdb` 是否合理、跨编码器回绕（0↔8191）不跳变
 
@@ -149,6 +174,8 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 3. 保证 `cmake --build` 通过（此时功能都没接线，编译过即可）。
 
 **验收**：能编译、能下载、能点灯（LED 最简单，先证明工具链通）。
+**验收结果（2026-10-11）**：三项**全部达成** —— 编译通过；`openocd program … verified` 烧写成功；复位后三色灯亮。
+（点灯是 `main.c` 自检代码直接驱动 GPIO 做到的；TODO #11 的独立 LED 模块仍未封装，属方向 E 的事。）
 
 **进度（2026-10-09）**：① 已做（`enable_language(C ASM CXX)` + C++17 + 四层 `include/`）；② 已做（`libs/src/pid.cpp`，见 §3.1）；
 ③ `cmake --build` 通过。**验收里"能下载、能点灯"仍缺硬件，挂起**（点灯还需先有 TODO #11 的 LED 模块）。
@@ -169,13 +196,18 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 实现建议：接收用 `HAL_UARTEx_ReceiveToIdle_DMA`（HAL 内部处理 IDLE）+ `HAL_UARTEx_RxEventCallback` 回调；发送 DMA 的 buffer 必须是 static/全局。
 
 **进度（2026-10-09）**：配置、`bsp_usart.cpp`（TODO #3）、`__io_putchar` 重定向、`main.c` 调 `bsp_Init()`
-**均已代码完成并编译通过**；**只剩上板验收**，因暂时没有硬件而挂起（详见 §3.3）。
+**均已代码完成并编译通过**。
 
-**拿到板子后照做**：
-1. 串口助手连 USART1（PA9=TX / PB7=RX），**115200 / 8N1**；
-2. 在 `main.c` 的 USER CODE 2、`bsp_Init();` 之后加一句 `printf("boot ok\r\n");`，重新编译下载 —— 看到打印即通过；
-3. 再做接收链路验证：临时实现强符号 `USART_RxCallback`（收什么回什么），验证"增量 + 缓冲回绕"算法；
-4. 现象、猜想、改动、结果记入 `docs/logs.md`。
+**进度（2026-10-11）**：已上板 —— 烧写成功、自检 LED 亮（复位后 500 ms），固件确实跑起来了。
+但**串口这一半没验**：手上没有串口线，`USART1` 的打印与接收都还没实测，故方向 A 记为**部分验收**。
+
+**拿到串口线后照做**（代码已就位，不需要再改）：
+1. 串口助手连 USART1（PA9=TX / PB7=RX），**115200 / 8N1、无流控**——复位后应看到 `[rm27] boot ok` 与 sysclk/tick 两行
+   （自检打印已在 `main.c` 的 `BSP_SELF_TEST` 里写好）；
+2. 再做接收链路验证：临时实现强符号 `USART_RxCallback`（收什么回什么），验证"增量 + 缓冲回绕"算法；
+3. 现象、猜想、改动、结果记入 `docs/logs.md`（2026-10-11 的上板记录已写入）。
+4. 提示：若手头是**蓝色 ST-Link V2 小 U 盘**那种烧写器，它常自带一路串口（插上会多出一个 COM 口），
+   可直接当 USB-TTL 用，同样注意 TX/RX 交叉、共地。
 
 ### 4.3 方向 B · CAN → 电机（保底分，越早跑通越好）
 
