@@ -90,6 +90,24 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
   （新回调被 `HAL_CAN_IRQHandler` 引用而保留；`CAN_Transmit` 暂无人调用、被 `--gc-sections` 丢弃）。
 - 未做（B 后续）：`DJIMotorHandler`（步骤 2）→ `M2006` + `DJIMotor.hpp` 参数（步骤 3）→ `control` 线程（步骤 4）。
 
+**2026-10-10 · 方向 B 步骤 2（`DJIMotorHandler`，TODO #9）代码完成，待上板验证**
+
+- `modules/src/DJIMotorHandler.cpp`（TODO #9）实现完成：
+  - `registerMotor`：校验 `hcan∈{&hcan1,&hcan2}` 与 `canId∈[0x201,0x208]`，登记到 `DJIMotorList[bus][canId-0x201]`，
+    按 ID 段置 `0x200`/`0x1FF` 存在标志，回填 `motor->hcan/canId`。
+  - `sendControlData`：仅发存在标志为 true 的报文；`currentSet` 按**大端**打入 8 字节（未注册槽位写 0）。
+  - `updateFeedback` / `UpdateSensorData`：大端解析 ecd/转速/电流/温度；编码器按 **±半圈判定回绕**后累加成输出轴连续角度；
+    转速按减速比换成 rad/s。常数（8192 计数/圈、减速比 M2006=36 等）按 `gearBox` 分派，放在本文件静态函数里。
+  - `AllMotorAliveCheck`：遍历两份列表调 `AliveCheck()`。
+  - **实现强符号 `CAN_RxCallback`**（覆盖 `bsp_can.cpp` 的弱符号）：在此层完成 `0x201~0x208 → index 0~7` 映射并调 `updateFeedback`，
+    补齐步骤 1 预留的上层出口。
+- `board/CMakeLists.txt`：`target_sources` 加 `modules/src/DJIMotorHandler.cpp`。
+- 验证：① 编译 `exit=0`、无告警；RAM 5528→**5624 B**、FLASH 29244→**29860 B**。
+  ② 算法层用 Python 逐行复现（**非执行 C++**）：大端组帧、反馈解析、±半圈回绕、减速比换算、跨回绕位置连续、
+  转子 36 圈→输出轴 2π，共 **15/15 通过**（脚本 `%TEMP%\motor_check.py`）。
+- 口径提醒：`motorFeedback.currentFdb` 目前存**原始计数值**（与参考工程一致），未换算成 A。
+- 未做（B 后续）：`M2006.cpp` + `DJIMotor.hpp` PID 参数（步骤 3）、`control` 线程（步骤 4）。
+
 ### 3.2 待补 TODO（唯一权威清单）
 
 | # | 文件:行 | 内容 | 所属方向 | 状态 |
@@ -102,7 +120,7 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 | 6 | `modules/src/BMI088.cpp:63,106,111,116,126,208,215,222` | 温控占空比、数据校验、寄存器读写、三轴/温度解析 | C | 待做 |
 | 7 | `modules/src/M2006.cpp:5,11,12,18` | 构造参数、松开/速度/位置双环、`maxCurrent` 限幅、`AliveCheck` | B | 待做 |
 | 8 | `modules/include/DJIMotor.hpp:65,66` | 速度环/位置环 PID 参数 | B | 待做 |
-| 9 | `modules/src/DJIMotorHandler.cpp:5,6,14,15,20,28,29,36` | 注册(0x201~0x208)、0x200/0x1FF 存在标志、组帧大端序、反馈解析+编码器回绕+减速比换算、存活检查 | B | 待做 |
+| 9 | `modules/src/DJIMotorHandler.cpp` | 注册(0x201~0x208)、0x200/0x1FF 存在标志、组帧大端序、反馈解析+编码器回绕+减速比换算、存活检查；并实现强符号 `CAN_RxCallback` | B | **代码完成，待上板验证** |
 | 10 | `threads/*`（空） | alive / imu / control 三个线程 + `main.c` 创建 | A~E | 待做 |
 | 11 | LED 模块 | 自行封装 GPIO（`bsp/` 下新增），供 alive 线程做灯效 | E | 待做 |
 
@@ -113,6 +131,7 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - [ ] A · USART 接收链路：发数据触发 `USART_RxCallback`（临时做回环：收什么回什么），验证增量+回绕算法
 - [ ] B · CAN 发送：RELAX 模式下用 CAN 分析仪确认 0x200/0x1FF 报文 ID 与 8 字节大端序，电流为 0
 - [ ] B · CAN 接收：电机上电后能收到 0x201~0x208 反馈，`CAN_RxCallback` 被触发（先用打印肉眼确认）
+- [ ] B · 反馈解析：转轴看 `positionFdb`/`speedFdb` 是否合理、跨编码器回绕（0↔8191）不跳变
 
 ---
 

@@ -56,6 +56,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${ROOT}/bsp/src/bsp_can.cpp
     ${ROOT}/libs/src/math.cpp
     ${ROOT}/libs/src/pid.cpp
+    ${ROOT}/modules/src/DJIMotorHandler.cpp
 )
 
 # Add include paths
