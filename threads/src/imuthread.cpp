@@ -21,6 +21,15 @@
  * 0 = 不驱动灯（方向 E 做出独立 LED 模块后，这段应删掉换成 LED 模块）*/
 #define IMU_SELF_TEST_LED 1
 
+/* ---------------- 温控（方向 D · D2） ----------------
+ * TEMP_CTRL_ENABLE  1 = 按 TEMP_CTRL_TARGET_C 闭环加热；0 = 恒不加热。
+ *   加热电阻就在 BMI088 旁边，**板载即可验证**：设一个比室温高一截的目标，
+ *   看温度往上走、duty 先大后小地收敛。首次上板建议先设 0 确认"不加热"这一侧。
+ * TEMP_CTRL_TARGET_C 目标温度（℃）。室温约 25 ℃，取 35~40 既能看出明显升温、
+ *   又不至于烤板子；设成低于当前温度（如 20）可作为"应完全不加热"的反向用例。*/
+#define TEMP_CTRL_ENABLE   1
+#define TEMP_CTRL_TARGET_C 40.0f
+
 /* ---------------- 线程参数 ---------------- */
 #define IMU_THREAD_STACK_SIZE 1024U
 #define IMU_THREAD_PRIORITY   10U /* 比 control(8) 低：IMU 晚一拍不影响电机安全 */
@@ -147,6 +156,14 @@ static void ImuThread_Entry(ULONG thread_input)
         g_imu.ReadGyroData(&g_imu.gyro_data);                  // rad/s
         g_imu.VerifyAccData();
         g_imu.VerifyGyroData();
+
+#if TEMP_CTRL_ENABLE
+        /* 温控闭环（方向 D · D2）。放在读温度之后，保证用的是本拍刚采到的温度；
+         * 也放在 Verify*Data 之后，让"加速度计通信失效"这一条能立刻把加热关掉。
+         * 调用频率 = 线程周期 1 ms。热时间常数是"秒"级，1 kHz 远快于对象，对纯 P 无影响；
+         * 将来 TempPid 若整定出积分项，需按 1 ms 的 dt 标定 ki（或改成每 N 拍调一次）。*/
+        g_imu.TemperatureControl(TEMP_CTRL_TARGET_C);
+#endif
 
 #if IMU_SELF_TEST_LED
         ImuLedUpdate();

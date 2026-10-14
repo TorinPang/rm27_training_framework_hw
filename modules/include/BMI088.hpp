@@ -69,6 +69,11 @@ enum BMI088_SENSOR
 #define TEMP_UNIT 0.125f
 #define TEMP_BIAS 23.0f
 
+/* 温度合理性带（℃）：温控前的兜底校验 —— 落在带外说明读数不可信（没上电/通信坏），
+ * 此时绝不能用它去闭环，否则"读到 0 ℃"会立刻算出满功率。带取得很宽，正常环境不会触发。*/
+#define TEMP_SANE_MIN_C (-20.0f)
+#define TEMP_SANE_MAX_C (100.0f)
+
 #define ACC_CONF_ADDR 0x40
 #define ACC_CONF_RESERVED 0x01
 /* acc_bwp 占寄存器的 [7:4]，手册 §5.3.8 给出的有效值是 0x08 / 0x09 / 0x0A

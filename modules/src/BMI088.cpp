@@ -95,10 +95,45 @@ namespace BMI088
 
     void cBMI088::TemperatureControl(float target_temp)
     {
-        // TODO: 温度读取完成后，用 TempPid 计算加热占空比并限制到 [0, 1]。
-        // 未完成前保持加热关闭。
-        (void)target_temp;
-        PWM_SetDutyRatio(&HEATING_RESISTANCE_TIM, 0.0f, HEATING_RESISTANCE_CHANNEL);
+        /* ---- 量纲口径（本轮定下，写在这里备查）----
+         * cIMU 里的 TempPid 是老师给的：PID(0.1, 0, 0, maxOut=25000, maxIOut=3)。
+         * maxOut=25000 与 PWM 要的 duty∈[0,1] 明显不是同一个量纲，PID 自身的输出限幅
+         * 在本用途下等于不起作用。这里选择**不动老师的参数**，而是在本函数内把 PID 输出
+         * 按"1.0 = 满功率"显式归一化到 [0,1] 再下发：
+         *     duty = clamp(TempPid.result, 0, 1)
+         * 于是 kp=0.1 的含义就是"每 1 ℃ 误差给 10 % 功率"（误差 10 ℃ 即满功率），
+         * 这对加热电阻是合理的 P 增益，也说明 25000 只是个够大的兜底值。
+         * 另外两条理由说明这样是安全的：
+         *   1) 加热只升温，不制冷 —— 负误差（已超温）一律截到 0；
+         *   2) 本轮 ki=kd=0（纯 P），maxIOut 不参与运算；将来若整定出积分项，
+         *      末端这道夹紧仍保证下发值一定合法。
+         * 代价：若以后带积分项，PID 的 maxIOut 与这里的 [0,1] 量纲仍需再对齐一次。*/
+
+        /* ---- 不安全的工况一律不加热，并把 PID 清干净 ---- */
+        const bool temp_valid = std::isfinite(acc_data.temperature) &&
+                                (acc_data.temperature > TEMP_SANE_MIN_C) &&
+                                (acc_data.temperature < TEMP_SANE_MAX_C);
+
+        if (self_test.INIT_ERR || self_test.ACC_DATA_ERR || !temp_valid ||
+            !std::isfinite(target_temp))
+        {
+            TempPid.Clear(); // 清掉累加量，避免带旧的积分参与下一次运算
+            self_test.TEMP_CTRL_ERR = true;
+            PWM_SetDutyRatio(&HEATING_RESISTANCE_TIM, 0.0f, HEATING_RESISTANCE_CHANNEL);
+            return;
+        }
+
+        TempPid.ref = target_temp;
+        TempPid.fdb = acc_data.temperature;
+        TempPid.UpdateResult();
+
+        /* 显式归一化到 [0,1]：负（含 NaN）→ 0，> 1 → 1 */
+        float duty = TempPid.result;
+        if (!(duty > 0.0f)) duty = 0.0f; // 这样写同时挡住 NaN
+        if (duty > 1.0f) duty = 1.0f;
+
+        PWM_SetDutyRatio(&HEATING_RESISTANCE_TIM, duty, HEATING_RESISTANCE_CHANNEL);
+        self_test.TEMP_CTRL_ERR = false;
     }
 
     void cBMI088::VerifyAccChipID()
