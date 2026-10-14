@@ -78,6 +78,10 @@ static void ControlThread_Entry(ULONG thread_input)
         // 3) 组帧并发出 0x200 / 0x1FF
         handler->sendControlData();
 
+        // 4) 向 alive 线程上报"本线程存活"（方向 E）。报的是线程在跑，与电机是否在线无关：
+        //    电机没接/掉线时本线程照样在跑、照样上报，此时该由 M2006::AliveCheck 判 OFFLINE。
+        Alive_NotifyMotorAlive();
+
         tx_thread_sleep(CONTROL_THREAD_TICK);
     }
 }

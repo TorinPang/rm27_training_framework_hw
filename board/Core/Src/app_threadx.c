@@ -65,7 +65,9 @@ UINT App_ThreadX_Init(VOID *memory_ptr)
   (void)byte_pool; /* 本工程的线程用静态栈，不用 CubeMX 的 byte pool */
 
   /* 创建应用线程。线程必须在两处之一创建：tx_application_define() 的调用链内，
-   * 或已运行的线程里；本工程走前者（App_ThreadX_Init 由 tx_application_define 调用）。 */
+   * 或已运行的线程里；本工程走前者（App_ThreadX_Init 由 tx_application_define 调用）。
+   * 顺序有讲究：alive 必须先建（它负责创建 3 个监控信号量，而 control/imu 一开始跑就会上报）。 */
+  AliveThread_Init();   /* 方向 E：建信号量 + alive 监控线程（优先级 20，最低） */
   ControlThread_Init(); /* 方向 B：control 线程，1 ms 周期跑电机控制 */
   ImuThread_Init();     /* 方向 C：imu 线程，BMI088 初始化 / 读三轴与温度 */
   /* USER CODE END App_ThreadX_Init */

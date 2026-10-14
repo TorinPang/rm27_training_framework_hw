@@ -1,7 +1,6 @@
 #include "threads.hpp"
 
 #include "BMI088.hpp"
-#include "main.h" //< LED_R/G/B 引脚宏（LED 是 README 允许线程直接调 HAL GPIO 的例外）
 
 /* ==================================================================== *
  * 方向 C · imu 线程（TODO #10 的 imu 部分）
@@ -10,16 +9,12 @@
  *       加速度/角速度/温度并做通信自检；数据放在 g_imu 里供其它线程读。
  *
  * 现状：C1（读通路 + ID 自检）、C2（数据解析 + 单位换算 + 通信自检）已完成。
- *       数据共享的互斥与 imu_alive 信号量属方向 E，这里先不做（单写者约定）。
+ *       灯效已交给方向 E 的 alive 线程（本线程不再直接驱动 GPIO）——
+ *       本线程只负责"读数据"和"按周期上报存活"两件事：
+ *         · 每轮 Alive_NotifyImuAlive()  → 表示 imu 线程还活着；
+ *         · 初始化成功后 Alive_NotifyInitOk() → 表示系统初始化完成。
+ *       数据共享仍走单写者约定（本线程写、其它线程读，不加互斥）。
  * ==================================================================== */
-
-/* ---------------- 上板调试开关（风格同 main.c 的 BSP_SELF_TEST） ----------------
- * 1 = 用三色灯显示 IMU 状态：
- *       绿 = 芯片 ID 都对、且数据没被判定为通信失效（正常运行态）；
- *       红 = 芯片 ID 不对（总线/片选/供电级故障，此时跳过 Config/Calibrate）；
- *       蓝 = ID 对但数据被判通信失效（拔掉或短接 MISO 就能复现，用于验收 C2）。
- * 0 = 不驱动灯（方向 E 做出独立 LED 模块后，这段应删掉换成 LED 模块）*/
-#define IMU_SELF_TEST_LED 1
 
 /* ---------------- 温控（方向 D · D2） ----------------
  * TEMP_CTRL_ENABLE  1 = 按 TEMP_CTRL_TARGET_C 闭环加热；0 = 恒不加热。
@@ -59,20 +54,6 @@ void ImuThread_Init(void)
                            TX_NO_TIME_SLICE,
                            TX_AUTO_START);
 }
-
-#if IMU_SELF_TEST_LED
-/* 三色灯刷新：红 = ID 错、蓝 = 数据错、绿 = 全好。
- * 放在主循环里每轮刷新，这样拔掉 MISO 之后能立刻看到灯变蓝（C2 验收要求）。*/
-static void ImuLedUpdate(void)
-{
-    const bool id_err = g_imu.self_test.ACC_CHIP_ID_ERR || g_imu.self_test.GYRO_CHIP_ID_ERR;
-    const bool data_err = g_imu.self_test.ACC_DATA_ERR || g_imu.self_test.GYRO_DATA_ERR;
-
-    HAL_GPIO_WritePin(LED_R_GPIO_Port, LED_R_Pin, id_err ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(LED_G_GPIO_Port, LED_G_Pin, (!id_err && !data_err) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(LED_B_GPIO_Port, LED_B_Pin, (!id_err && data_err) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-}
-#endif
 
 /* BMI088 的经典坑：ACC_PWR_CTRL / ACC_PWR_CONF 这两次写**不保证一次生效**。
  * 本工程实测（见 docs/logs.md 第四篇）：Config() 里写完 ACC_PWR_CTRL=0x04 之后回读，
@@ -146,6 +127,11 @@ static void ImuThread_Entry(ULONG thread_input)
         if (!g_imu.self_test.ACC_CHIP_ID_ERR && !g_imu.self_test.GYRO_CHIP_ID_ERR)
         {
             g_imu.self_test.INIT_ERR = false;
+
+            /* 向 alive 线程上报"系统初始化完成"（方向 E）。这是一次性事件，
+             * 报早了等于说谎，所以放在 Config/Calibrate 都跑完、INIT_ERR 清掉之后。
+             * 若这里始终没执行（ID 错 / 初始化卡住），alive 线程会在 10 s 后判定"初始化失败"。*/
+            Alive_NotifyInitOk();
         }
     }
 
@@ -165,9 +151,10 @@ static void ImuThread_Entry(ULONG thread_input)
         g_imu.TemperatureControl(TEMP_CTRL_TARGET_C);
 #endif
 
-#if IMU_SELF_TEST_LED
-        ImuLedUpdate();
-#endif
+        /* 向 alive 线程上报"imu 线程存活"（方向 E）：每轮一次，alive 线程据此判断
+         * 本线程是否还在跑。注意上报点在**读数据之后** —— 只要线程还在转就上报，
+         * 与"IMU 数据是否有效"无关（数据有效性由 self_test 标志表达，另行观察）。*/
+        Alive_NotifyImuAlive();
 
         tx_thread_sleep(IMU_THREAD_TICK);
     }

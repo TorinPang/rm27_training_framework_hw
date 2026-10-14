@@ -55,6 +55,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${ROOT}/bsp/src/bsp_usart.cpp
     ${ROOT}/bsp/src/bsp_can.cpp
     ${ROOT}/bsp/src/bsp_pwm.cpp   # 方向 D：加热(TIM10_CH1)+舵机(TIM1_CH1) PWM 封装
+    ${ROOT}/bsp/src/bsp_led.cpp   # 方向 E：三色灯模块（TODO #11），供 alive 线程做灯效
     ${ROOT}/libs/src/math.cpp
     ${ROOT}/libs/src/pid.cpp
     ${ROOT}/modules/src/DJIMotorHandler.cpp
@@ -62,6 +63,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${ROOT}/modules/src/BMI088.cpp
     ${ROOT}/threads/src/controlthread.cpp
     ${ROOT}/threads/src/imuthread.cpp
+    ${ROOT}/threads/src/alivethread.cpp # 方向 E：alive 线程（信号量监控 + 灯效）
 )
 
 # Add include paths

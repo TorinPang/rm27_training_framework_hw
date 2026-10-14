@@ -270,6 +270,39 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
   故怀疑**加热回路上没有功率**：最可能是**板子只由 ST-Link 供电、没接自己的主电源**（加热电阻挂在 5 V/VM 轨上，
   ST-Link 不产生这条轨）。→ 待确认供电后复测（同一份固件即可，无需改代码）；也可用万用表量 PF6 与加热电阻的供电端。
 
+**2026-10-14 · 方向 E 步骤 1+2：LED 模块（TODO #11）+ alive 线程（TODO #10 的 alive 部分）代码完成，待上板验证**
+
+- 新增 `bsp/include/bsp_led.hpp` + `bsp/src/bsp_led.cpp`（TODO #11）：`LED_Init / LED_Set / LED_SetAll / LED_Off`，
+  颜色→引脚查表（PH12/PH11/PH10，**高电平亮**），带电平缓存（电平没变就不重复写 GPIO）与 `LED_ENABLE` 开关。
+  **不重复 `HAL_GPIO_Init`** —— 引脚方向由 CubeMX 的 `MX_GPIO_Init` 负责，本模块只写电平（两处各配一份是隐患）。
+  `bsp_Init()` 末尾调 `LED_Init()`（全灭）。
+- 填 `threads/src/alivethread.cpp`（此前是空文件）：
+  - 3 个计数型信号量 `init_ok` / `imu_alive` / `motor_alive`；**在 `AliveThread_Init()` 里先建信号量、再建线程**。
+  - alive 线程参数：静态栈 **512 B**（`aligned(8)`）、优先级 **20**（全场最低）、周期 **100 ms**。
+  - **监控模型（关键）**：上游每周期 `put` 上报 → alive 每周期把信号量**排空**并计数 → 次数低于阈值即判"该方已停"。
+    **必须排空而不是只 `get` 一次**：计数型信号量的计数会一直累加，只取一次的话上报方早停了也留着旧值、
+    永远判不出"死了"。阈值取 5 次（正常约 100 次/周期），既不会误报也不会漏报。
+  - **上报接口**：`Alive_NotifyInitOk()`（imu 线程初始化成功后报**一次**）、`Alive_NotifyImuAlive()`、
+    `Alive_NotifyMotorAlive()`（后两者各线程**每轮**一次）；`threads.hpp` 已加 `extern "C"` 声明。
+  - **灯效（每个状态独占一种，肉眼可区分）**：初始化中=**绿慢闪**、初始化失败（10 s 超时）=**红常亮**、
+    全部正常=**绿常亮**、imu 线程死=**蓝常亮**、control 线程死=**红蓝交替**、两个都死=**红+蓝常亮**。
+  - **故障注入开关** `ALIVE_INJECT_INIT_FAIL / _IMU_DEAD / _MOTOR_DEAD`（默认 0）：照常排空但丢弃该路计数，
+    等价于"该方没上报"，用于逐条验收三种故障灯效；置 0 时被编译器完全优化掉（编译体积不变已验证）。
+  - **宽限周期**：首次 latch 到 `init_ok` 的那一周期不判线程存活 —— imu 线程可能刚进主循环、窗口没填满，
+    直接判会误闪一次"线程死"。
+- `threads/src/controlthread.cpp`：循环里加 `Alive_NotifyMotorAlive()`。**口径**：报的是"control 线程在跑"，
+  与"电机是否在线"无关（电机掉线时线程照样上报，在线与否是 `M2006::AliveCheck` 的事）。
+- `threads/src/imuthread.cpp`：**删掉 `ImuLedUpdate` 与 `IMU_SELF_TEST_LED` 开关**（灯效收口到 alive 线程，
+  两个线程同写一组 GPIO 会互相打架），改为 `Alive_NotifyInitOk()` / `Alive_NotifyImuAlive()`；
+  至此 imu 线程不再直接写 GPIO（也不再需要 `main.h`）。IMU 数据错误仍可用 SWD 读 `g_imu.self_test` 观察。
+- `board/Core/Src/app_threadx.c`：`AliveThread_Init()` 放在 `ControlThread_Init()` / `ImuThread_Init()` **之前**
+  —— 信号量必须先于被监控线程存在，否则会丢上报。
+- `board/CMakeLists.txt`：`target_sources` 加 `bsp/src/bsp_led.cpp` 与 `threads/src/alivethread.cpp`。
+- 编译验证：`exit=0`、**无告警**；RAM 8768 → **9544 B (+776)**、FLASH 47932 → **50060 B (+2072)**。
+  RAM 增量用 `nm` 逐项核对：`alive_thread_stack` 512 + `alive_thread` 176 + 3×`TX_SEMAPHORE` 84 + `LedState` 3 ≈ 775 B（与 +776 吻合）。
+- **未做：上板验证**（用户当前手上没有板子）—— 清单见 §3.3 的 E 段，全部**板载即可自验、不需要任何外部硬件**。
+  `main.c` 的 `BSP_SELF_TEST` **未改动**：它在内核启动前点灯、结束即全灭，与 alive 线程不冲突。
+
 ### 3.2 待补 TODO（唯一权威清单）
 
 | # | 文件:行 | 内容 | 所属方向 | 状态 |
@@ -283,8 +316,8 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 | 7 | `modules/src/M2006.cpp` | 构造参数、松开/速度/位置双环、`maxCurrent` 限幅、离线保护、`AliveCheck` | B | **代码完成，待上板整定**（PID 增益为起步值） |
 | 8 | `modules/include/DJIMotor.hpp:65,66` | 速度环/位置环 PID 参数 | B | **代码完成，待上板整定** |
 | 9 | `modules/src/DJIMotorHandler.cpp` | 注册(0x201~0x208)、0x200/0x1FF 存在标志、组帧大端序、反馈解析+编码器回绕+减速比换算、存活检查；并实现强符号 `CAN_RxCallback` | B | **代码完成，待上板验证** |
-| 10 | `threads/src/controlthread.cpp`、`threads/src/imuthread.cpp`、`threads/include/threads.hpp`、`Core/Src/app_threadx.c` | **control / imu 线程已完成**（均为 1 ms 周期、静态栈）；alive 线程待做。创建位置由 `main.c` 修正为 `app_threadx.c` | A~E | **部分完成**（imu 的初始化 + 三轴/温度读数已上板验证；alive 待做） |
-| 11 | LED 模块 | 自行封装 GPIO（`bsp/` 下新增），供 alive 线程做灯效 | E | 待做 |
+| 10 | `threads/src/controlthread.cpp`、`threads/src/imuthread.cpp`、`threads/src/alivethread.cpp`、`threads/include/threads.hpp`、`Core/Src/app_threadx.c` | **control / imu / alive 三个线程全部完成**（静态栈；control/imu 1 ms、alive 100 ms）；alive 用 3 个信号量监控 init/imu/control 并做灯效。创建位置由 `main.c` 修正为 `app_threadx.c` | A~E | **代码全部完成**（imu 已上板验证；alive 待上板，见 §3.3 E 段） |
+| 11 | LED 模块 | 自行封装 GPIO（`bsp/` 下新增），供 alive 线程做灯效 | E | **代码完成，待上板验证**（`bsp/src/bsp_led.cpp`；`main.c` 自检未改） |
 
 ### 3.3 上板验证清单
 
@@ -345,6 +378,20 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - [ ] D · **温控闭环指标**：目标温度阶跃后温度收敛、无持续振荡；目标低于当前温度时 duty 归 0（**duty 归 0 已验**，升温段待供电）
 - [ ] D · **舵机（D3，选做）**：0°/90°/180° ↔ 500/1500/2500 µs（无舵机就读 CCR1 核对）
 
+**待做 · E · alive 线程与灯效（**板载即可自验，不需要任何外部硬件**）**
+
+- [ ] E · **alive 线程在跑**：`alive_thread.tx_thread_run_count` 1.5 s 内 +15（100 ms/轮）、`state=TX_SLEEP`；栈水位 < 512 B
+- [ ] E · **三个信号量已建**：`_tx_semaphore_created_count = 3`；逐个读 `init_ok_sem` / `imu_alive_sem` / `motor_alive_sem` 的 `count`
+- [ ] E · **初始化中**：上电后约 0~4.5 s（BMI088 初始化期间）应为 **绿慢闪**
+- [ ] E · **全部正常**：初始化完成且三路上报齐全 → **绿常亮**；SWD 读 `GPIOH->ODR` 应为 `0x800`（bit11=绿）
+- [ ] E · **初始化失败**：`alive` 里置 `ALIVE_INJECT_INIT_FAIL=1` 重编译 → 10 s 后转 **红常亮**（`ODR` bit12）
+- [ ] E · **IMU 线程死**：置 `ALIVE_INJECT_IMU_DEAD=1` → **蓝常亮**（`ODR` bit10）
+- [ ] E · **control 线程死**：置 `ALIVE_INJECT_MOTOR_DEAD=1` → **红蓝交替**（1 Hz）
+- [ ] E · **恢复**：三个注入开关都置回 0 后灯回到绿常亮（排除"一直红/一直蓝"的伪现象）
+- [ ] E（可选，端到端）：把 `imuthread.cpp` / `controlthread.cpp` 里的 `Alive_Notify*` 注释掉，效果应与注入开关一致
+- 备注：C 的"短接 MISO 复现 `ACC_DATA_ERR`"改用 SWD 读 `g_imu.self_test` 观察 —— 蓝灯已改表示"imu 线程死"，
+  不再兼职显示 IMU 数据错误（旧行为只在方向 E 之前临时存在）。
+
 ---
 
 ## 4. 执行计划
@@ -362,7 +409,8 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 
 **验收**：能编译、能下载、能点灯（LED 最简单，先证明工具链通）。
 **验收结果（2026-10-11）**：三项**全部达成** —— 编译通过；`openocd program … verified` 烧写成功；复位后三色灯亮。
-（点灯是 `main.c` 自检代码直接驱动 GPIO 做到的；TODO #11 的独立 LED 模块仍未封装，属方向 E 的事。）
+（点灯是 `main.c` 自检代码直接驱动 GPIO 做到的；TODO #11 的独立 LED 模块已于 2026-10-14 封装为
+`bsp/src/bsp_led.cpp`，成为后续"谁点灯"的唯一出口，见 §3.1。）
 
 **进度（2026-10-09）**：① 已做（`enable_language(C ASM CXX)` + C++17 + 四层 `include/`）；② 已做（`libs/src/pid.cpp`，见 §3.1）；
 ③ `cmake --build` 通过。**验收里"能下载、能点灯"仍缺硬件，挂起**（点灯还需先有 TODO #11 的 LED 模块）。
@@ -437,6 +485,12 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 信号量监控三件事 + 灯效（TODO #10,#11）。
 
 **验收**：初始化失败/IMU 线程死/电机线程死，三种情况灯效可区分。
+
+**进度（2026-10-14）**：步骤 1+2 **代码完成** —— LED 模块（TODO #11）+ alive 线程与 3 个信号量（TODO #10 的 alive 部分），
+编译通过、无告警（RAM 9544 B / FLASH 50060 B）。灯效约定与故障注入开关见 §3.1 与 §3.3 的 E 段。
+**上板验证待做**（用户当时手上没有板子）；E 的全部验收项都只需板子本身，拿到板子即可一次跑完。
+`g_imu` 的数据共享出口已按**单写者约定**处理（imu 线程写、其它线程读，不加 `tx_mutex`）——
+本阶段无第二个写者，故不引入锁；将来若有写者增加，再补互斥或双缓冲。
 
 ### 4.7 时间顺序
 
