@@ -1,0 +1,9 @@
+{
+    "cmake.sourceDirectory": "${workspaceFolder}/board",
+    "cmake.buildDirectory": "${workspaceFolder}/build/${buildType}",
+    "cmake.generator": "Ninja",
+    "cmake.toolchainFile": "${workspaceFolder}/board/cmake/gcc-arm-none-eabi.cmake",
+    "cmake.configureSettings": {
+        "CMAKE_MAKE_PROGRAM": "C:/STM32/ninja-win/ninja.exe"
+    }
+}
