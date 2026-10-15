@@ -87,7 +87,11 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
   - 接收：强符号实现 `extern "C" HAL_CAN_RxFifo0MsgPendingCallback`（只取数据帧里的标准帧），
     再经**弱符号 `CAN_RxCallback(hcan, StdId, data)`** 上交 —— 与 `USART_RxCallback` 同一约定，
     让 `bsp/` 不反向 include `modules/`（守住 §2 分层）。**ID→电机 index 的映射留给上层 `DJIMotorHandler`（B 步骤 2）**。
-  - 弱符号此处给的是**空实现**（非 USART 那样的裸声明）：万一上层还没提供强符号，调用落到空函数而非地址 0。
+  - 弱符号此处给的是**空实现**（与 USART 那样的裸声明不同）：上层未提供强符号时，调用落到空函数，报文被丢弃。
+
+> **更正（2026-10-15，`objdump` 反汇编实证）**：此前后 §3 里"USART 的裸声明弱符号，上层不给强符号会跳到地址 0"
+> 的说法**不准确**。实测 `board.elf` 中 `HAL_UARTEx_RxEventCallback` 的三处 `USART_RxCallback` 调用点
+> 全部被链接器替换为 `nop.w`（0x800861c / 0x8008644 / 0x8008656）：数据被静默丢弃，**不会跳飞**。
 - 编译验证：`exit=0`、**无告警**；RAM 5528 B 不变、FLASH 28560 → **29244 B (+684)**
   （新回调被 `HAL_CAN_IRQHandler` 引用而保留；`CAN_Transmit` 暂无人调用、被 `--gc-sections` 丢弃）。
 - 未做（B 后续）：`DJIMotorHandler`（步骤 2）→ `M2006` + `DJIMotor.hpp` 参数（步骤 3）→ `control` 线程（步骤 4）。
@@ -303,6 +307,26 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - **未做：上板验证**（用户当前手上没有板子）—— 清单见 §3.3 的 E 段，全部**板载即可自验、不需要任何外部硬件**。
   `main.c` 的 `BSP_SELF_TEST` **未改动**：它在内核启动前点灯、结束即全灭，与 alive 线程不冲突。
 
+**2026-10-15 · 收尾清理（4 条小遗留）**
+
+- **① 陈旧注释**：`modules/include/IMU.hpp` 里 `VerifyAccData` / `VerifyGyroData` 的 `@todo 未实现` 已删 ——
+  两者实际在 `modules/src/BMI088.cpp:174/190` 已实现（判据：6 个原始字节全同 + 有限值检查），注释改为指向实现的 `@note`。
+- **② 上层出口写进头文件**：`USART_RxCallback` / `CAN_RxCallback` 的声明补进 `bsp/include/bsp_usart.hpp` /
+  `bsp_can.hpp`（此前只存在于 `.cpp` 里，接手者看不到签名）。**签名与 `.cpp` 中的定义完全一致，不改变弱符号语义。**
+  - **实证更正**：反汇编 `board.elf` 后确认，`USART_RxCallback` **未实现**时，它在 `HAL_UARTEx_RxEventCallback`
+    内的三个调用点（0x800861c / 0x8008644 / 0x8008656）会被链接器替换成 **`nop.w`** —— 即数据被静默丢弃，
+    **并不会跳到地址 0**。此前 §3.1 及项目笔记里"跳到地址 0"的说法不准确，已更正。
+  - 对照：`CAN_RxCallback` 由 `DJIMotorHandler.cpp` 提供强符号，`nm` 显示为 `T`（强定义）。
+- **③ include guard 命名**：`bsp_led.hpp` / `bsp_pwm.hpp` / `IMU.hpp` 的 guard 由旧工程的 `RM26_H7_*` 前缀
+  统一为 `BSP_LED_HPP` / `BSP_PWM_HPP` / `IMU_HPP`；`bsp_can.hpp` 的 guard（`BSP_CAN_H`）与尾注释（`// BSP_CAN_HPP`）
+  不一致也一并对齐。纯命名，无功能影响。
+- **④ `BSP_SELF_TEST` 置 0**（`board/Core/Src/main.c`）：上板自检已完成（灯亮已确认），不再每次上电执行。
+  副作用（预期、非 bug）：`printf` 整条链失去活引用，被 `--gc-sections` 丢弃，**镜像显著变小**；
+  需要复测串口打印时把该宏改回 1。
+- 编译验证：`ninja -C board/build/Debug` → `exit=0`、**无告警**、`board.elf` 生成成功；
+  **当前镜像 RAM 9520 B (7.26%) / FLASH 44520 B (4.25%)**（相对 §3.1 上次记录的 9544 / 50060 双双下降，
+  差值即 printf 族被丢弃的代码）。
+
 ### 3.2 待补 TODO（唯一权威清单）
 
 | # | 文件:行 | 内容 | 所属方向 | 状态 |
@@ -317,14 +341,15 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 | 8 | `modules/include/DJIMotor.hpp:65,66` | 速度环/位置环 PID 参数 | B | **代码完成，待上板整定** |
 | 9 | `modules/src/DJIMotorHandler.cpp` | 注册(0x201~0x208)、0x200/0x1FF 存在标志、组帧大端序、反馈解析+编码器回绕+减速比换算、存活检查；并实现强符号 `CAN_RxCallback` | B | **代码完成，待上板验证** |
 | 10 | `threads/src/controlthread.cpp`、`threads/src/imuthread.cpp`、`threads/src/alivethread.cpp`、`threads/include/threads.hpp`、`Core/Src/app_threadx.c` | **control / imu / alive 三个线程全部完成**（静态栈；control/imu 1 ms、alive 100 ms）；alive 用 3 个信号量监控 init/imu/control 并做灯效。创建位置由 `main.c` 修正为 `app_threadx.c` | A~E | **代码全部完成**（imu 已上板验证；alive 待上板，见 §3.3 E 段） |
-| 11 | LED 模块 | 自行封装 GPIO（`bsp/` 下新增），供 alive 线程做灯效 | E | **代码完成，待上板验证**（`bsp/src/bsp_led.cpp`；`main.c` 自检未改） |
+| 11 | LED 模块 | 自行封装 GPIO（`bsp/` 下新增），供 alive 线程做灯效 | E | **代码完成，待上板验证**（`bsp/src/bsp_led.cpp`） |
 
 ### 3.3 上板验证清单
 
 **已完成**
 
 - [x] **烧写 + 运行自检**（2026-10-11）：`program … verify` → `Verified OK`；复位后三色灯齐亮 500 ms 再灭
-      → 时钟 / 烧写 / 运行全通。（`BSP_SELF_TEST` 开关留在 `main.c`，改 0 即不再执行、代码保留。）
+      → 时钟 / 烧写 / 运行全通。（`BSP_SELF_TEST` 开关留在 `main.c`，**2026-10-15 已置 0**：
+      自检代码不再编译进固件；需要复测串口打印时改回 1。）
 - [x] **内核启动 + control 线程运行**（2026-10-11，无电机，SWD 读内存）：`_tx_thread_system_state=0`、
       2 个线程已建；`control_thread.run_count` 1.5 s 内 +1508 ≈ **1 ms/轮**；栈水位 339/1024 B；
       `control_motor` 各字段与设计一致（见 §3.1）。

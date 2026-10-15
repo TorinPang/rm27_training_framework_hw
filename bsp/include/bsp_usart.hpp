@@ -45,4 +45,17 @@ void USART_Transmit(UART_HandleTypeDef *huart, uint8_t *pData, uint16_t Size, en
  */
 void USART_Receive(UART_HandleTypeDef *huart, uint8_t *pData, uint16_t Size);
 
-#endif //  __BSP_USART_H
+/**
+ * @brief 串口接收数据出口（弱符号，上层可实现同名函数覆盖）。
+ * @note 由 bsp_usart.cpp 的空闲中断回调（HAL_UARTEx_RxEventCallback）在每收到一段
+ *       新数据后调用，用来把数据交给上层（如命令解析、裁判系统解包）。
+ *       ⚠ 本符号在 bsp/ 内**只有声明、没有默认定义**（与 CAN_RxCallback 不同）：
+ *       上层若不提供强符号，调用会被链接器替换成 NOP（实测 `nop.w`），即数据被静默丢弃 ——
+ *       不会跳飞崩溃，但也无人处理收到的数据，用到它时请务必给出实现。
+ * @param huart 触发接收的串口句柄（USART1 或 USART6）
+ * @param pData 指向本次新增数据的指针（指向 bsp 的静态接收缓冲区，需要保留请自行拷贝）
+ * @param Size  本次新增数据的长度（循环 DMA 的累计量与缓冲回绕已由 bsp 处理）
+ */
+void USART_RxCallback(UART_HandleTypeDef *huart, uint8_t *pData, uint16_t Size);
+
+#endif // BSP_USART_HPP

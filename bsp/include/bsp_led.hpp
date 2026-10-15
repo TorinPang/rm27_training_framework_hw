@@ -2,8 +2,8 @@
 // 方向 E · LED 模块（TODO #11）
 //
 
-#ifndef RM26_H7_BSP_LED_HPP
-#define RM26_H7_BSP_LED_HPP
+#ifndef BSP_LED_HPP
+#define BSP_LED_HPP
 
 #include <stdint.h>
 
@@ -53,4 +53,4 @@ void LED_Off(void);
 }
 #endif
 
-#endif //RM26_H7_BSP_LED_HPP
+#endif //BSP_LED_HPP

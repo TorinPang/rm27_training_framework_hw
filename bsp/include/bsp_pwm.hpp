@@ -2,8 +2,8 @@
 // Created by cosmosmount on 2025/9/2.
 //
 
-#ifndef RM26_H7_BSP_PWM_HPP
-#define RM26_H7_BSP_PWM_HPP
+#ifndef BSP_PWM_HPP
+#define BSP_PWM_HPP
 
 #include "tim.h"
 
@@ -38,4 +38,4 @@ void PWM_SetPeriod(TIM_HandleTypeDef *htim, float period);
  */
 void PWM_SetDutyRatio(TIM_HandleTypeDef *htim, float dutyratio, uint32_t channel);
 
-#endif //RM26_H7_BSP_PWM_HPP
+#endif //BSP_PWM_HPP

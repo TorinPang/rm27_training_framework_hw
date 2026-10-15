@@ -2,8 +2,8 @@
 // Created by cosmosmount on 2025/9/2.
 //
 
-#ifndef RM26_H7_IMU_HPP
-#define RM26_H7_IMU_HPP
+#ifndef IMU_HPP
+#define IMU_HPP
 
 #include "pid.hpp"
 
@@ -102,15 +102,15 @@ public:
 
     /**
      * @brief 验证加速度计数据
-     * @todo 未实现
+     * @note 已实现，见 BMI088.cpp：判据为「6 个原始字节全同」且数值有限。
      */
     virtual void VerifyAccData() = 0;
 
     /**
      * @brief 验证陀螺仪数据
-     * @todo 未实现
+     * @note 已实现，见 BMI088.cpp：判据与 VerifyAccData 相同。
      */
     virtual void VerifyGyroData() = 0;
 };
 
-#endif //RM26_H7_IMU_HPP
+#endif //IMU_HPP
