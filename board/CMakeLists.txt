@@ -58,6 +58,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     ${ROOT}/bsp/src/bsp_led.cpp   # 方向 E：三色灯模块（TODO #11），供 alive 线程做灯效
     ${ROOT}/libs/src/math.cpp
     ${ROOT}/libs/src/pid.cpp
+    ${ROOT}/libs/src/ref.cpp     # 参考曲线（给定信号发生器，整定用：Constant/Step/Triangle）
     ${ROOT}/modules/src/DJIMotorHandler.cpp
     ${ROOT}/modules/src/M2006.cpp
     ${ROOT}/modules/src/BMI088.cpp

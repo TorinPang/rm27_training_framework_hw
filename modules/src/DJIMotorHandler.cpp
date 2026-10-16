@@ -4,6 +4,14 @@
 extern CAN_HandleTypeDef hcan1;
 extern CAN_HandleTypeDef hcan2;
 
+/* 静态成员的存储定义（声明在 DJIMotorHandler.hpp）。零初始化，故不需要显式初值。
+ * 做成静态成员而非普通成员，是为了让它在符号表里有独立符号，
+ * 上板时可直接观察报文打包结果（见头文件里的说明）。 */
+uint8_t DJIMotorHandler::can1_send_data_0[8];
+uint8_t DJIMotorHandler::can1_send_data_1[8];
+uint8_t DJIMotorHandler::can2_send_data_0[8];
+uint8_t DJIMotorHandler::can2_send_data_1[8];
+
 /* ------------------------------------------------------------------ *
  * 协议常数（对照 DJI 手册与课程参考工程核对）
  * ------------------------------------------------------------------ */

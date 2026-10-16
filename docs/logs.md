@@ -444,3 +444,146 @@ RAM 增量 = 512 + 176 + 84 + 3 = 775 B，与实测 +776 B 吻合（差 1 B 为�
 - 若上板后发现"正常态"判成了故障，先查 `ALIVE_MIN_REPORTS`（阈值是否偏高）与 alive 是否被饿死
   （优先级 20 最低，若高优先级线程长期不让出，alive 自己会停摆）。
 - 数据共享出口按**单写者约定**处理（imu 写、其它读，暂不加 `tx_mutex`）；将来出现第二个写者再补锁或双缓冲。
+
+## 2026-10-15（晚）· 方向 B 上板整定：反馈链 → 速度环 → 双环位置
+
+（时间上早于下面那节 E 段验收，为便于对照放在一起。）
+
+### 1. 观察/整定手段：PnX Platform 在线写入 + 实时曲线
+
+VS Code 的 Live Watch 只能看不能写，改用 **PnX Platform**（`D:\PnX Platform`，安装版 1.1.10）在线改增益 + 画曲线。
+
+- PnX **枚举不到 `control_motor` 的成员**：`M2006` 没有自己的数据成员，`controlMode` / `speedSet` / `speedPid`
+  全部继承自基类 `DJIMotor`，而 PnX 的成员枚举只列**直接成员**（不处理 DWARF 的 `DW_TAG_inheritance`；
+  gdb / cortex-debug 支持继承，所以 VS Code 那边能看到）。
+- 对策：在 `threads/src/controlthread.cpp` 加一组**影子全局标量**（`CONTROL_TUNE_LIVE` 开关），
+  控制线程每轮把"写入方向"的影子变量抄进电机对象、把"回读方向"的状态抄出来。
+  **泛化教训：给上位机工具的在线可写变量要做成普通全局标量，别指望它穿透类继承。**
+- PnX 侧另有两个坑（详见 `AGENTS.md` §3.3 与项目笔记）：① 源码扫描硬上限（6000 文件 / 32 MB）
+  被本仓库的 HAL+CMSIS 整包撑爆 → 全变量判只读（已给 `initialized-globals.mjs` 的 skip 名单加
+  `Drivers`/`Middlewares` 修掉）；② 必须点「**可写连接**」而不是「连接目标板」，后者是只读采样。
+- 停机出口 = 写 `control_tune_mode = 0`（RELAX，下一拍 `currentSet=0` + PID 清零）。
+  停止调试会话、按复位键、暂停/单步都**停不了**电机，故调试期固件默认保持 RELAX。
+
+### 2. 定位到一个真 bug：`AliveCheck` 单拍误判，把积分周期性抹掉
+
+现象：加了 `ki` 却消不掉静差，曲线上 `control_cmd_current`（电流指令）**周期性掉到 0 再弹回来**。
+
+根因：C610 反馈 1 kHz（电调晶振）vs 控制线程 1 kHz（板子 HSE），两个时钟有 ppm 级偏差 →
+相位缓慢漂移 → **周期性地出现某一拍恰好没等到新反馈**。原 `AliveCheck()` 是"本拍没新帧 = 离线"，
+于是那一拍 `setOutput()` 走进离线分支：`currentSet = 0` + **`speedPid.Clear()`** —— 刚攒起来的积分被一巴掌抹掉。
+
+- 为什么 `ki=5` 时反而"看起来正常"：ki=5 时积分 0.4 s 就顶到 ±3000 限幅，比空窗间隔快得多，bug 被掩盖。
+- 修法：新增 `AliveMissCount`，**连续 ≥ `M2006_OFFLINE_CYCLES`(=5) 拍**没收到新帧才判 OFFLINE，收到即清零。
+  真实拔线 5 ms 内照样检出，单拍空窗不再误杀 PID。
+- 另加回读影子变量 `control_fdb_alive_miss`（累计空窗次数，正常时缓慢增长）便于肉眼确认。
+- 修改文件：`modules/include/DJIMotor.hpp`、`modules/src/M2006.cpp`、`threads/src/controlthread.cpp`。
+
+### 3. 速度环整定（结果：kp=160 / ki=0.15 / kd=0）
+
+给定用 `RefCurve` 生成（`libs/src/ref.cpp`，形状与参考工程 `RM27-tutorial-PID` 一致），
+按老师顺序走：Constant → Step → Triangle。
+
+| 阶段 | 参数 | 观察 | 结论 |
+|---|---|---|---|
+| 纯 P | kp=30, ki=0 | 指令 150 计数（0.15 A）电机不动 | **静摩擦死锁**：小 P 起不动电机 |
+| 纯 P | kp=160, ki=0 | 反馈稳在 **8.45**（给定 10） | 静差 1.55 = 纯 P 固有 |
+| 加 I | kp=160, ki=5 | **等幅极限环振荡** 9~11.7 | ki 过大（未乘 dt，可用区间约 0.02~0.5） |
+| 定稿 | kp=160, ki=0.15 | 阶跃 10→6 无超调、无持续振荡；三角波 ±6/4 s 跟随良好 | **合格** |
+
+- 复测：`speed_set` 扫 ±6 / 0 全程贴住；换向瞬间电流有 −380 计数刹车尖峰后回落 ~250（正常）。
+- 三角波**过零处有 stick-slip 平台**：摩擦力在速度过零时换向，需要积分攒够力矩才脱困；
+  另 C610 低速时转速反馈量化为 0 会放大视觉长度。**属硬件特性非 bug，不修，记录即可。**
+- 注意本工程 `ki` **未乘 dt**（`pid.cpp` 里是 `iResult += ki*err[0]`），1 kHz 下每毫秒积分涨 `ki×e`。
+
+### 4. 双环位置整定（结果：kp=40 / ki=0.15 / kd=0，输出限幅 6 rad/s）
+
+1. **先对齐零点**：编码器是增量式的、没有绝对零点，写 `control_tune_pos_zero` 把当前姿态定为 0 rad
+   （同时清位置环、位置给定归零，避免"归零瞬间外环看到大误差"而窜车）。
+   语义按**值变化沿**触发（写 1、2、3… 各触发一次），而不是"写 1 后自动清 0"——后者会让 PnX 回读校验失败。
+2. `ref_shape=0`（改用手写 `pos_set`）→ `pos_max_spd=5~6` 保守 → `pos_kp` 从 10 起 → `mode=2` → `pos_set=1 rad`。
+3. **实测**：
+   - `pos_set=1 rad` 一次到位，稳定后余差 ~0.004 rad（≈0.23°，静摩擦所致，可接受）。
+   - 三角波 ±6 rad 跟随：外环直线段斜率与给定一致（整体略滞后，双环固有代价）；**角点削峰 ~0.5~1 rad**
+     （三角角点瞬间反向，电机转速得从 +6 减到 −6，"刹不住"那段被削掉——内部限速越低削得越多）。
+   - 内环 `control_fdb_speed_ref` 全程 **±6 方波**（外环几乎一直顶限幅，说明 kp 已足够），
+     实际转速边沿陡、平台稳、顶部小超调即回稳。
+4. **已写回源码**（三处保持一致）：`DJIMotor.hpp` 的位置环默认值、`M2006.cpp` 的 `M2006_POS_SPEED_LIMIT = 6.0f`、
+   `controlthread.cpp` 的影子变量初值。速度环同样已写回 `DJIMotor.hpp`。
+
+### 5. 收尾：调试设施下线（`CONTROL_TUNE_LIVE = 0`）
+
+两环增益都写回源码后，把 `threads/src/controlthread.cpp` 的 `CONTROL_TUNE_LIVE` 置 **0**，
+让整套在线整定设施退出固件：影子变量定义、线程里的抄写（写入方向）与回读（只读方向）代码、
+`ShapeFromCode()`、`RefCurve` 实例与计时起点。
+
+> 本轮顺手修了一个"承诺没兑现"的问题：原来只有**线程里的抄写/回读代码**在 `#if` 里，
+> **变量定义本身在外面** —— 置 0 后那 26 个变量仍会占 RAM，且 `ShapeFromCode()` 变成未使用函数会被 `-Wall` 报警。
+> 现已把定义区（连同 `control_ref_start_ms` 的初始化）一并包进 `#if CONTROL_TUNE_LIVE`。
+
+- 实测体积：**RAM 9656 → 9528 B（−128 B）**、**FLASH 49800 → 44552 B（−5248 B）**
+  （FLASH 这 5 KB 主要是 `RefCurve` 的 `PeriodicSmoothStep` 用到的 `std::cos` 把 libm 拖进来的那部分，
+  现在没人引用就被 `--gc-sections` 丢了）。
+- `nm` 校验：`control_tune*` / `control_fdb*` / `control_cmd_current` / `control_state` / `RefCurve`
+  的符号数**全为 0**；`control_motor`（文件内 static）等正常运行符号照常保留。
+- 代价：PnX 里那几个在线变量会消失（已有监视列表会失效）。以后再要在线整定，把宏改回 `1` 重新编译烧写即可。
+- 注意：`libs/src/ref.cpp` 与 `libs/include/ref.hpp` **仍留在工程与 CMake 里**（源码可复用，只是当前无人引用）。
+
+
+
+
+为免去"改开关→重编"的来回，把 E 段四条验收所需的固件**一次性全部编好**（源码最终已复位为三个开关全 0）：
+
+| 版本 | 注入开关 | 预期灯效 | 文件（`%TEMP%\alive_test\`） |
+|---|---|---|---|
+| e1 | `ALIVE_INJECT_INIT_FAIL=1` | 10 s 后**红常亮** | `e1_init_fail.elf` |
+| e2 | `ALIVE_INJECT_IMU_DEAD=1` | **蓝常亮** | `e2_imu_dead.elf` |
+| e3 | `ALIVE_INJECT_MOTOR_DEAD=1` | **红蓝交替**（1 Hz） | `e3_motor_dead.elf` |
+| e4 | 三个全 0（= 正式固件） | 上电 **绿慢闪** → **绿常亮** | `e4_normal.elf` |
+
+**编译取证**（确认四个版本的差异真的落在 alive 线程里，而不只是别的字节）：
+对每个 ELF 取 `AliveThread_Entry` 的函数体反汇编做 md5，四个**互不相同**：
+
+| 版本 | 地址 | 大小 | 函数体 md5(前 16) |
+|---|---|---|---|
+| e1 | `0x0800ab1c` | `0x158` | `31bae3be6616cdce` |
+| e2 | `0x0800ab1c` | `0x158` | `70a31bab86ea37b4` |
+| e3 | `0x0800ab1c` | `0x158` | `55e3da35763a89d9` |
+| e4 | `0x0800ab1c` | `0x154` | `20f328e78cca3f05` |
+
+（注入版本比正式版大 4 B：`-O0` 下 `if (宏)` 置 0 会把整块代码删掉，置 1 则留下 `reports = 0` 的指令。）
+
+**烧写**（每次换版本，先断开 PnX —— ST-Link 同一时刻只能被一个调试器占用）：
+
+```
+openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -c "program <版本文件> verify reset exit"
+```
+
+**寄存器层取证（可选，但比肉眼更硬）**：`GPIOH->ODR` = `0x40021C14`，
+红 = bit12(`0x1000`)、绿 = bit11(`0x800`)、蓝 = bit10(`0x400`)。
+
+```
+openocd -f interface/stlink.cfg -f target/stm32f4x.cfg \
+  -c "init" -c "reset run" -c "sleep 12000" -c "halt" -c "mdw 0x40021C14 1" -c "reset run" -c "shutdown"
+```
+
+红蓝交替要采两次（间隔取 500 ms 的错相位，例如 sleep 500 与 sleep 1000），
+分别应读到 `0x1000` 与 `0x400`。
+
+**等待时间口径**：BMI088 初始化 ≈ 4.5 s（期间绿慢闪）；"初始化失败"判定 = 100 个 alive 周期 = **10 s**；
+线程存活判定每周期一次（100 ms），所以 e2/e3 的故障灯在初始化完成后的下一周期即出现。
+
+**结果记录（2026-10-15 晚实机，四个固件逐一烧写）**：
+
+| 项 | 预期 | 实测 | 结论 |
+|---|---|---|---|
+| E1 初始化中 | 绿慢闪（约 4.5 s） | 绿慢闪 | 通过 |
+| E2 初始化失败 | 10 s 后红常亮 | 绿慢闪**撑满 10 s** → 红常亮 | 通过 |
+| E3 IMU 线程死 | 蓝常亮 | 蓝常亮 | 通过 |
+| E4 control 线程死 | 红蓝交替 1 Hz | 红蓝交替 | 通过 |
+| E5 恢复 | 三个开关归 0 → 绿常亮且保持 | 烧回 `e4_normal.elf` → 绿慢闪 → 绿常亮 | 通过 |
+
+**结论**：E 段四条故障/暂态灯效**全部实机确认**，灯色约定（红=初始化失败、蓝=imu 线程死、红蓝交替=control 线程死、绿常亮=全正常）成立，
+且"一直红/一直蓝"的伪现象已排除（复位后能回绿常亮）。三项注入开关的判定阈值（10 s / 100 ms 周期）也与预期一致。
+
+（可选未做：把 `imuthread.cpp` / `controlthread.cpp` 里的 `Alive_Notify*` 注释掉做端到端复现 —— 与注入开关效果等价，且已由本次注入验证覆盖。）

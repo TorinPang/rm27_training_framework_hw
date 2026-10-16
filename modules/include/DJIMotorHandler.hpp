@@ -14,11 +14,15 @@ public:
      */
     DJIMotor *DJIMotorList[2][8]{};
 
-    uint8_t can1_send_data_0[8]{}; // CAN1电机控制数据，用于控制0x201-0x204
-    uint8_t can1_send_data_1[8]{}; // CAN1电机控制数据，用于控制0x205-0x208
+    /* 发送缓冲区声明为 static：它们只承载"本拍要发出去的 8 字节"，不属于某个实例的状态
+     * （本类本就是单例，语义不变），但做成静态成员后会有独立符号，
+     * 上板时可直接在调试器里看 `DJIMotorHandler::can1_send_data_0` 来验证报文打包。
+     * 定义在 DJIMotorHandler.cpp。 */
+    static uint8_t can1_send_data_0[8]; // CAN1电机控制数据，用于控制0x201-0x204
+    static uint8_t can1_send_data_1[8]; // CAN1电机控制数据，用于控制0x205-0x208
 
-    uint8_t can2_send_data_0[8]{}; // CAN2电机控制数据，用于控制0x201-0x204
-    uint8_t can2_send_data_1[8]{}; // CAN2电机控制数据，用于控制0x205-0x208
+    static uint8_t can2_send_data_0[8]; // CAN2电机控制数据，用于控制0x201-0x204
+    static uint8_t can2_send_data_1[8]; // CAN2电机控制数据，用于控制0x205-0x208
 
     // 四个标志位，用于判断是否需要发送控制数据
     bool CAN1_0x200_Exist = false; // CAN1是否存在控制报文为0x200电机

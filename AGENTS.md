@@ -73,6 +73,8 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
   - 末端统一按 `maxOut` 限幅；`result` 出现 NaN/Inf 时 `Clear()` 归零后返回（输出 0，安全侧）。
 - `board/CMakeLists.txt`：`target_sources` 加 `libs/src/math.cpp`（`Numeric::LimitABS` 的定义处，pid.cpp 依赖它）
   与 `libs/src/pid.cpp`。
+- **2026-10-15 晚追加**：`libs/src/ref.cpp` + `libs/include/ref.hpp`（参考曲线 `RefCurve`，整定用给定信号发生器，
+  形状 Constant/Step/Triangle/PeriodicSmoothStep；已挂进 `target_sources`，`libs/include` 本来就在 include 路径里）。
 - 验证：① 增量编译通过（`exit=0`，FLASH 仍 28560 B —— PID/math 尚未被任何代码调用，被 `--gc-sections` 丢弃属正常）；
   ② 本机无 host 编译器，故用 Python 复现同一递推式做数值交叉验证：P/I/D 三项、积分限幅、输出限幅、
   增量累加、NaN 保护、一阶对象闭环收敛（2000 拍收敛到目标），并把"误差符号写反"的对照组跑出发散作为判别性检查 —— 全部通过。
@@ -131,15 +133,21 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 
 **2026-10-11 · 方向 B 步骤 3：`M2006` 参数与双环（TODO #7/#8）**
 
-- `modules/include/DJIMotor.hpp:65,66`：填**起步增益**（速度环 `kp=30`、位置环 `kp=10`，均为位置式、先纯 P 保证安全）；
+- `modules/include/DJIMotor.hpp:65,66`：填增益（起始为起步值、先纯 P 保证安全；**2026-10-15 晚上板整定后
+  速度环 = `kp=160 / ki=0.15 / kd=0`、位置环 = `kp=40 / ki=0.15 / kd=0`**，均为位置式）；
   `maxOut`/`maxIOut` 保持 **0 作安全默认**，由派生类按型号绑定。
   量纲约定：速度环输入 rad/s、输出电流指令(原始计数)；位置环输入 rad、输出速度给定(rad/s)，串级进速度环。
 - `modules/src/M2006.cpp`：
   - 构造：`gearBox=GearBox_M2006`、`maxCurrent=10000`（C610 ±10000 ↔ ±10A），绑定
-    `speedPid.maxOut=maxCurrent`、`speedPid.maxIOut=3000`、`positionPid.maxOut=maxIOut=20 rad/s`（保守起步值，官方空载 500 rpm ≈ 52.36 rad/s 为天花板）。
+    `speedPid.maxOut=maxCurrent`、`speedPid.maxIOut=3000`、`positionPid.maxOut=maxIOut=6 rad/s`
+    （**2026-10-15 上板整定值**；官方空载 500 rpm ≈ 52.36 rad/s 为天花板，调大即更快更冲）。
   - `setOutput()`：RELAX → 0 并清 PID；SPD → 速度环；POS → 位置环串速度环。均以 `Numeric::LimitABS(result, maxCurrent)` 落 `currentSet`。
     另加**离线保护**：`MotorState != MOTOR_ONLINE` 时输出 0 并清 PID（避免反馈丢失后速度环积分饱和失控）。
   - `AliveCheck()`：比较 `AliveFlag`/`Pre_AliveFlag` 后**无条件**记录 `Pre_AliveFlag`（参考工程只在 online 分支记录，属可改进点）。
+    **去抖（2026-10-15 晚上板实修）**：反馈与控制线程同为 1 kHz 但不同晶振 → 相位漂移周期性出现“单拍没等到新帧”，
+    单拍判 OFFLINE 会让 `setOutput` 周期性清 PID——积分被抹掉（表现为加 ki 消不掉静差、`currentSet` 周期性掉 0）。
+    现改为 `AliveMissCount` 连续 ≥ `M2006_OFFLINE_CYCLES`(=5) 拍才判 OFFLINE；真实拔线 5 ms 内仍可检出。
+    `DJIMotor` 新增 `uint32_t AliveMissCount`；影子变量 `control_fdb_alive_miss` 可在 PnX 观察空窗频率。
 - `board/CMakeLists.txt`：`target_sources` 加 `modules/src/M2006.cpp`。
 - 验证：① 编译 `exit=0`、无告警；**镜像大小不变**（RAM 6056 B / FLASH 35660 B）——
   因尚无代码构造 `M2006`，其 `.text` 全部落在 `board.map` 的 `Discarded input sections`，要等步骤 4 的 control 线程接上才进固件。
@@ -327,6 +335,23 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
   **当前镜像 RAM 9520 B (7.26%) / FLASH 44520 B (4.25%)**（相对 §3.1 上次记录的 9544 / 50060 双双下降，
   差值即 printf 族被丢弃的代码）。
 
+**2026-10-15（晚）· 上板调试便利性：4 个发送缓冲改为 static 成员**
+
+- **问题**：在线调试（VS Code cortex-debug Live Watch / gdb）看 `can1_send_data_0` 报
+  `unable to create variable object` —— 它是**普通成员**，只活在该类单例对象里，而单例是
+  `Instance()` 的**函数内局部静态**（`DJIMotorHandler.hpp:56`），没有可被名字解析的全局符号。
+- **改动**：`modules/include/DJIMotorHandler.hpp:17-25` 的 4 个 `can*_send_data_*` 加 **`static`**、
+  去掉类内 `{}` 初始化；`modules/src/DJIMotorHandler.cpp` 顶部补 4 行存储定义（零初始化）。**语义不变**
+  ——它们只承载"本拍要发出去的 8 字节"，本就属于类级缓冲而非实例状态，且本类就是单例。
+- **验证**：`ninja` → `exit=0`、无告警；`nm` 得到独立符号
+  `DJIMotorHandler::can1_send_data_0` @ **`0x20001034`**（.bss；四个依次 0x1034 / 0x103c / 0x1044 / 0x104c，
+  间隔 8 B）。对此后 Watch 里直接写 `DJIMotorHandler::can1_send_data_0` 即可。
+  镜像：RAM 9520 B（不变）/ FLASH 44520 → **44496 B**。
+- **调试字段速查**（重新编译后地址会变，用 `nm` 重取）：
+  `control_motor` = `_ZL13control_motor` @ `0x20001508`；发送帧见上表；`g_imu` 为全局符号（`imu` 线程里未加 static）。
+- **Live Watch 的采样陷阱**：它是**运行中采样**（20 次/秒），`currentSet` 与 `can*_send_data_*` 可能取自
+  不同时刻（控制线程 1 ms 一拍）。**验大端序时必须先 halt 再读两个值**，才是同拍的一致快照。
+
 ### 3.2 待补 TODO（唯一权威清单）
 
 | # | 文件:行 | 内容 | 所属方向 | 状态 |
@@ -336,9 +361,9 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 | 3 | `bsp/src/bsp_usart.cpp` | 双串口 DMA+空闲中断、启动接收、按 mode 发送 | A | **代码完成**；接收/发送未验（**无串口线**，见 §3.3） |
 | 4 | `bsp/src/bsp_can.cpp` | `CAN_Transmit` 组帧发送；接收回调取帧并上交上层（弱符号 `CAN_RxCallback`） | B | **代码完成，待上板验证** |
 | 5 | `modules/include/BMI088.hpp:21` | SPI 句柄 + ACC/GYRO 片选宏 | C | **代码完成，已上板验证** |
-| 6 | `modules/src/BMI088.cpp:84` | 温控占空比（属方向 D）、数据校验、寄存器读写、三轴/温度解析 | C·D | **代码全部完成**（读写/解析/`Verify*Data` 已上板验证；温控已实现且软件侧验证，**"温度真的升上去"待板子接主电源后复测**） |
-| 7 | `modules/src/M2006.cpp` | 构造参数、松开/速度/位置双环、`maxCurrent` 限幅、离线保护、`AliveCheck` | B | **代码完成，待上板整定**（PID 增益为起步值） |
-| 8 | `modules/include/DJIMotor.hpp:65,66` | 速度环/位置环 PID 参数 | B | **代码完成，待上板整定** |
+| 6 | `modules/src/BMI088.cpp:84` | 温控占空比（属方向 D）、数据校验、寄存器读写、三轴/温度解析 | C·D | **代码全部完成；读写/解析/`Verify*Data`/温控均已上板验证**（2026-10-15 晚接主电源后 27.4 → **41~42 ℃**，见 §3.3 D 段） |
+| 7 | `modules/src/M2006.cpp` | 构造参数、松开/速度/位置双环、`maxCurrent` 限幅、离线保护、`AliveCheck` | B | **代码完成；两环均已上板整定**（速度环 160/0.15/0，位置环 40/0.15/0，输出限幅 6 rad/s） |
+| 8 | `modules/include/DJIMotor.hpp:65,66` | 速度环/位置环 PID 参数 | B | **两环增益均已定值并写回代码**（上板整定结果） |
 | 9 | `modules/src/DJIMotorHandler.cpp` | 注册(0x201~0x208)、0x200/0x1FF 存在标志、组帧大端序、反馈解析+编码器回绕+减速比换算、存活检查；并实现强符号 `CAN_RxCallback` | B | **代码完成，待上板验证** |
 | 10 | `threads/src/controlthread.cpp`、`threads/src/imuthread.cpp`、`threads/src/alivethread.cpp`、`threads/include/threads.hpp`、`Core/Src/app_threadx.c` | **control / imu / alive 三个线程全部完成**（静态栈；control/imu 1 ms、alive 100 ms）；alive 用 3 个信号量监控 init/imu/control 并做灯效。创建位置由 `main.c` 修正为 `app_threadx.c` | A~E | **代码全部完成**（imu 已上板验证；alive 待上板，见 §3.3 E 段） |
 | 11 | LED 模块 | 自行封装 GPIO（`bsp/` 下新增），供 alive 线程做灯效 | E | **代码完成，待上板验证**（`bsp/src/bsp_led.cpp`） |
@@ -355,6 +380,19 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
       `control_motor` 各字段与设计一致（见 §3.1）。
 - [x] **CAN 发送链已执行（寄存器层）**：`CAN1->ESR` BOFF=1、`TSR` 三邮箱全满、邮箱内容
       **STID=0x200 / DLC=8 / 8 字节全 0**；`BTR` → **1 Mbps**。无电机故 TEC 累加到 248 后 bus-off（协议行为）。
+- [x] **首次在线调试（2026-10-15 晚，板子 + ST-Link，暂无串口线）**：改用 VS Code **cortex-debug + Live Watch** 观察，
+      确认 `alive_thread.tx_thread_run_count = 73`（线程在跑、内核调度正常）、
+      `g_imu.acc_data.temperature = 27.375 ℃`（BMI088 读数可读）、
+      `control_motor.MotorState = MOTOR_OFFLINE`（**未接电机，符合预期**）、`currentSet = 0`。
+      → **"无串口线"期间的观察手段 = SWD（Live Watch / `halt`+`mdw`）+ 三色灯**；printf 不可用，
+      `BSP_SELF_TEST` 保持 0。
+- [x] **E 段主项已验**（同晚）：alive `run_count` +15/1.5 s、`_tx_semaphore_created_count = 3`、
+      灯 **绿常亮**（`GPIOH->ODR = 0x800`）→ 三个线程与 alive 监控链正常。
+- [x] **E 段四条故障/暂态灯效全验**（同晚，四个预编译固件逐一烧写）：
+      初始化中绿慢闪 → 初始化失败红常亮（撑满 10 s）→ IMU 线程死蓝常亮 → control 线程死红蓝交替 → 复位后回绿常亮。
+      **E 段至此全部完成**（仅剩一项可选的"注释 `Alive_Notify*` 端到端"未做）。
+- [x] **接主电源后板载供电轨确认正常**（同晚）：温控由 27.4 升到 41~42 ℃（详见下方 D 段）。
+      **这条同时是方向 B 的前置** —— CAN 收发器吃同一条轨，此前"总线上只有本机"的 bus-off 现象需在接电池后重新解读。
 
 **待做 · A · 串口 —— 当前阻塞：手上没有串口线**
 
@@ -369,12 +407,132 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - [x] B · RELAX 电流为 0：`CONTROL_TEST_MODE=0` 应发 0 电流 —— 邮箱内容 8 字节全 `0x00` **已确认**
 - [x] B · 控制线程在跑：`control_thread` 状态 `TX_SLEEP`、`run_count` 约 1005 次/秒、栈水位 339/1024 B **已确认**
 - [x] B · **总线只有本机时的现象**：无电调/分析仪应答时 `ESR` BOFF=1、TEC=248、邮箱积压 —— **已实测复现**，属协议行为、非软件 bug
-- [ ] B · CAN 接收：电机上电后能收到 0x201~0x208 反馈，`CAN_RxCallback` 被触发（先用打印肉眼确认）
-- [ ] B · 反馈解析：转轴看 `positionFdb`/`speedFdb` 是否合理、跨编码器回绕（0↔8191）不跳变
-- [ ] B · **手册复核**：手动转输出轴**整一圈**，确认编码器计数/圈（8192 还是 8191）与减速比 36 同时成立
-- [ ] B · 速度环跟随：给 `speedSet` 阶跃，看 `speedFdb` 收敛、无持续振荡（**PID 需先整定**）
-- [ ] B · 双环位置：`positionSet` 到位后停住、超调可接受（注意 `positionFdb` 无绝对零点，需先归零）
-- [ ] B · 离线检测：拔 CAN，`AliveCheck` 应在下一周期转 OFFLINE 且 `currentSet` 归 0
+- [x] B · **CAN 接收 / 反馈解析**（2026-10-15 晚，M2006+C610+电池）：`control_motor.MotorState` 0 → **1**
+      → 物理链路（线序/终端/1 Mbps）+ 反馈解析 + 注册分发链同时通过。
+      **副作用**：能收到帧即证明电调在 ACK、TEC 攒不到 248、BUS-OFF 已退出 ——
+      原计划的"看 `ESR` 的 TEC 归零"这一步被本项覆盖，不必单独验。
+- [x] B · 手转输出轴：`speedFdb` / `positionFdb` / `ecd` 变化合理
+- [x] B · **换算链复核**：整圈 ≈ 2π（用户报"与预期一致"；**未逐项抄录精确数值**，后续整理文档时可补一个数）
+- [x] B · 编码器回绕：慢转跨 0↔8191 角度连续、无跳变
+- [x] B · **离线检测**：拔 CAN → `AliveCheck` 下一周期转 OFFLINE 且 `currentSet` 归 0
+      （**交叉验证**：此时三色灯应**仍是绿常亮** —— alive 判的是"线程在跑"而非"电机在线"，两概念由此分开）
+- [x] B · **8 字节大端序（B6）—— 2026-10-15 晚验证通过 ✅**
+      `CONTROL_TEST_MODE=1（SPD）`、`speedSet=5 rad/s` 时 halt 读：
+      `control_motor.currentSet = 150`，`can1_send_data_0 = {0x00, 0x96, 0, 0, 0, 0, 0, 0}`
+      → `[0]`=高字节、`[1]`=低字节 = 150，其余 6 字节为 0（未注册槽位补 0），**与设计一致**。
+      `[2]~[7]` 全 0 同时反证"只在有电机的槽位填值"这条逻辑生效。
+      ⚠ **`CONTROL_TEST_MODE` 已于当晚改回 0（RELAX）** —— 从此上电/复位默认静止；
+      需要转时用 PnX 在线写 `control_motor.controlMode = 1`（在线改的只在 RAM，掉电即回 RELAX）。
+- [x] B · **★ 单电机转起来（保底分）—— 2026-10-15 晚达成 ✅**
+      首次 SPD 试验（`speedSet=5 rad/s`）时 `currentSet = 150`（**0.15 A**）**电机纹丝不动**，原因定位如下：
+      **是控制器性质而非 bug** —— 纯 P（`kp=30, ki=0`）下电流指令 = 30 × 误差(rad/s)；
+      0.15 A 不足以克服 M2006 **减速箱静摩擦**（需要几百 mA），电机不转 ⇒ `speedFdb` 恒 0 ⇒
+      误差恒为设定值 ⇒ 电流指令**永远停在 150**，卡在**静摩擦死锁平衡点**（纯 P 无积分，无法自己爬升）。
+      **对策 ①**：给大目标让初始误差变大 —— `CONTROL_TEST_SPEED` 5 → **30 rad/s** ⇒ 900 计数 ≈ 0.9 A。
+      **结果**：电机转动 ✓、`speedFdb` 明显低于 30 rad/s（纯 P 静差）✓、`currentSet` 升到几百并随转速稳定 ✓。
+      **对策 ②**：加 `ki` 消静差（B7 正题）。
+      → 泛化教训：**带减速箱的电机，小 P 起不动**；整定速度环前先确保指令电流能越过静摩擦。
+- [x] B · 速度环跟随：给 `speedFdb` 一个**阶跃 / 三角波**给定，看它收敛、无持续振荡
+      （**已整定**，见下方“速度环整定结果”）。给定信号由 `RefCurve` 生成（`control_tune_ref_shape=1/2`），
+      画 `control_fdb_ref` vs `control_fdb_speed` 两条曲线——三角波形状就是参考工程里的“锯齿”跟随曲线。
+- [x] B · 双环位置（2026-10-15 晚）：`positionSet` 到位后停住、超调可接受
+      （**已整定**：`kp=40 / ki=0.15 / kd=0`、输出限幅 `6 rad/s`，已写回代码；
+      另测三角波 ±6 rad 跟随——内环 `speed_ref` 全程方波、外环角点削峰 ~0.5~1 rad 属物理代价）。
+      注意 `positionFdb` 无绝对零点 → 进 POS 前**先写 `control_tune_pos_zero` 对齐零点**。
+
+**⚠ 上板调参工具改用 PnX Platform**（2026-10-15 晚用户决定：从 PID 整定起不再用 VS Code）
+
+- 工具：`HKUSTGZ-ROBOMASTER-PNX/pnx_studio`（"PnX Platform"）—— 独立 Electron 工作台 + 自带 Rust 探针后端，
+  支持 ST-Link / DAPLink，集成编辑器、CMake 构建、烧录调试、**实时曲线 + CSV**、**在线变量写入**；不改动本工程源码。
+- **★ 在线整定用法（实测修正）**：PnX **看不到 `control_motor` 的成员** —— 因为 `M2006` 一个自己的数据成员都没有，
+  `controlMode` / `speedSet` / `speedPid` 全部**继承自基类 `DJIMotor`**，而 PnX 的成员枚举只列**直接成员**
+  （gdb / cortex-debug 支持继承，所以 VS Code 那边能看到 `control_motor.speedSet`）。
+  → 对策：`threads/src/controlthread.cpp` 里新增了一组**影子全局变量**（`CONTROL_TUNE_LIVE` 开关控制，
+  置 0 时完全不参与编译），控制线程每轮把它们抄进电机对象。**整定时直接写这几个量即可，无需重编**：
+
+  | 变量 | 含义 |
+  |---|---|
+  | `control_tune_mode` | 0=RELAX（松开/停机） 1=SPD 2=POS；非法值落到 switch 的 default → 输出 0（安全） |
+  | `control_tune_speed_set` | 速度给定 rad/s（输出轴）；**仅 `ref_shape=0`（Constant）时生效** |
+  | `control_tune_pos_set` | 位置给定 rad（输出轴）；同样仅 Constant 时生效 |
+  | `control_tune_kp` / `ki` / `kd` | 速度环增益（每轮同步进 `speedPid`） |
+  | `control_tune_pos_kp` / `pos_ki` / `pos_kd` | **位置环（双环外环）增益**（每轮同步进 `positionPid`） |
+  | `control_tune_pos_max_spd` | **位置环输出限幅** = 允许的最高转速给定 rad/s（默认 20）——双环里最重要的安全旋钮 |
+  | `control_tune_pos_zero` | **零点对齐命令**：写一个与当前值不同的数（1、2、3…）→ 当前位置定为 0 rad、清位置环、给定归零，**再对齐一次就换个数再写** |
+  | `control_tune_ref_shape` | 参考曲线形状：**0=常数 1=阶跃 2=三角(默认) 3=周期平滑阶跃** |
+  | `control_tune_ref_low` / `ref_high` | 曲线低值/高值（默认 −6 / +6；POS 模式下单位是 rad） |
+  | `control_tune_ref_step_ms` | 阶跃：多少 ms 后跳到高值（默认 1000） |
+  | `control_tune_ref_period_ms` | 三角/平滑阶跃的周期 ms（默认 4000） |
+
+  **回读方向**（同样因为继承问题枚举不到 `motorFeedback`，故一并镜像；用于监看/实时曲线）：
+
+  | 变量 | 含义 |
+  |---|---|
+  | `control_fdb_speed` | 输出轴角速度 rad/s（**画曲线的主角**） |
+  | `control_fdb_ref` | **本拍实际给定**（SPD → rad/s，POS → rad）—— 画“给定 vs 反馈”的给定曲线 |
+  | `control_fdb_speed_ref` | **双环诊断：内环（速度环）的给定** = 位置环输出 rad/s；外环调不动时先看它是否被 `pos_max_spd` 削平 |
+  | `control_fdb_position` | 输出轴角度 rad（多圈累计） |
+  | `control_fdb_current` / `control_fdb_temp` | 电流反馈（原始计数）/ 温度 ℃ |
+  | `control_fdb_ecd` | 编码器原始读数 0~8191（看回绕用） |
+  | `control_state` | MotorState：0=OFFLINE 1=ONLINE |
+  | `control_cmd_current` | 本拍实际下发的电流指令（限幅后，看是否贴着上限） |
+  | `control_fdb_alive_miss` | 累计“本拍没等到新反馈”的次数（AliveCheck 去抖计数，**正常时缓慢增长**） |
+
+  代价：整套调试设施（26 个影子变量 + 抄写/回读代码 + `RefCurve`）开启时 RAM 9656 B（7.37%）、
+  FLASH 49800 B（4.75%）；**2026-10-15 晚已把 `CONTROL_TUNE_LIVE` 置 0**（整定完毕），
+  变量定义与线程里的抄写/回读代码、`ShapeFromCode`、`RefCurve` 一并退出编译 →
+  实测 **RAM 9528 B（7.27%，−128 B）、FLASH 44552 B（4.25%，−5248 B）**，
+  `nm` 里 `control_tune*` / `control_fdb*` / `RefCurve` 符号均为 **0 个**（`control_motor` 等正常保留）。
+
+  最小的调参视图 = `control_fdb_ref`（给定）+ `control_fdb_speed`（反馈）+ `control_cmd_current`（输出）三条曲线。
+  （再次需要在线整定时：把 `CONTROL_TUNE_LIVE` 改回 1 → 重新编译 → 烧写即可。）
+
+  **速度环整定结果（2026-10-15 晚，空载 M2006+C610，已写回 `DJIMotor.hpp:74`）**：
+  **kp = 160 / ki = 0.15 / kd = 0**。判据与过程：① 常数段 `speed_set=10` → 反馈稳在 10.0（纯 P 160 时为 8.45，静差 1.55）；
+  ② ±6 与 0 扫描全程贴住；③ 阶跃（`ref_shape=1`，10→6）无超调、无持续振荡，换向瞬间电流 −380 计数刹车尖峰后回落；
+  ④ 三角波 ±6 / 4 s 跟随良好，**过零处有 stick-slip 平台**（静摩擦在速度过零时换向，需积分攒够力矩才脱困；
+  另 C610 低速反馈量化为 0 会放大视觉长度）—— 属**硬件特性非 bug**，不修，记录即可。
+  ⑤ 曾误用 `ki=5` → 等幅极限环振荡（ki 未乘 dt，1 kHz 下可用区间约 0.02~0.5）。
+
+  **双环位置整定步骤（外环，`control_tune_mode=2`）**：
+  1. **先对齐零点**：手把电机停在目标姿态 → 写 `control_tune_pos_zero = 1`（值变化即触发；再对齐一次就写 2、3…）
+     → 确认 `control_fdb_position ≈ 0`。
+     编码器是增量式的，不做这一步写 `pos_set` 可能直接甩一个角度找目标。
+     （**语义按"值变化沿"而不是"写 1 然后自动清 0"**：自动清零会让 PnX 写完回读时读到 0 而报 `Target readback did not verify`。）
+  2. **内环必须先好**（本工程已完成）：外环输出就是内环给定，内环跟不上外环白调。
+  3. **`pos_max_spd` 先保守**（默认已整定为 6 rad/s；怕窜可先写 5），它决定“位置误差 1 rad 时最多用多快冲过去”。
+  4. **从小 kp 起**：`pos_kp = 10` 起（本工程整定后取 **40**）→ 写 `mode=2`、`ref_shape=0`、`pos_set=1` 看是否到位。
+     不到位/爬得慢 → 加 kp；**到位但来回过冲** → 减 kp。速度环已有积分，外环**通常纯 P 就够**。
+  5. **有余差再加 `pos_ki`**（从小，如 0.05；外环积分同样未乘 dt，区间与内环同量级）。
+  6. 画 `control_fdb_ref`（位置给定 rad）vs `control_fdb_position`（位置反馈 rad）看外环；
+     再画 `control_fdb_speed_ref` vs `control_fdb_speed` 看内环有没有跟上外环的要求。
+  7. ⚠ 位置环是“有记忆”的：`positionSet` 变了它就一定追过去，**整定时 `pos_set` 不要一次给太大**（建议 1 rad 级别起步）。
+
+  **★ 位置环整定结果（2026-10-15 晚，已写回代码）**：`kp=40 / ki=0.15 / kd=0`、输出限幅 `pos_max_spd = 6 rad/s`
+  （同步落在 `DJIMotor.hpp` 的位置环默认值、`M2006.cpp` 的 `M2006_POS_SPEED_LIMIT`、`controlthread.cpp` 影子初值三处，保持一致）。
+  实测：① `pos_set=1 rad` 一次到位，稳定后余差 ~0.004 rad（≈0.23°，静摩擦所致，7~9 位判定合格）；
+  ② 三角波 ±6 rad 跟随——外环直线段斜率与给定一致（整体略滞后，双环固有代价）、角点削峰 ~0.5~1 rad（内部限速 + 摩擦）；
+  ③ 内环 `speed_ref` 全程 ±6 方波、实际转速边沿陡、平台稳、顶部小超调即回稳 → 外环基本一直顶限幅，说明 kp 已足够；
+  ④ 前一步用 `pos_kp=10` 时也能到位但几乎无余差消除能力，`pos_ki` 才把最后那点余差压下去。
+
+  **给定信号发生器**：`libs/include/ref.hpp` + `libs/src/ref.cpp`（`RefCurve`，纯算法、无 HAL，与参考工程
+  `RM27-tutorial-PID/User/Lib/Ref/ref.hpp` 语义一致）。形状 `Constant / Step / Triangle / PeriodicSmoothStep`，
+  由 `control_tune_ref_*` 在线切换；控制线程每拍用 `tx_time_get() - control_ref_start_ms` 取值（1 tick = 1 ms）。
+  单位跟随当前模式：**SPD → rad/s、POS → rad**。建议实验顺序：Constant（确认方向）→ Step（看阶跃响应）→ Triangle（看跟随误差）。
+  注意 `RefShape::PeriodicSmoothStep` 引入 `std::cos`，会让 FLASH 多约 5 KB（本工程 FLASH 占用仍 <5%）。
+
+  为什么能写：它们是**显式初始化的普通全局标量**，必进 PnX 的写入白名单（符号名无修饰，见 `nm`）。
+  对照：`g_imu.TempPid.ref` 每周期被入参重写，**不能**当在线整定对象。
+  ✅ **整定值已写回源码 + 调试设施已下线**（2026-10-15 晚）：速度环 160/0.15/0 在 `DJIMotor.hpp`、
+  位置环 40/0.15/0 + 输出限幅 6 rad/s 在 `DJIMotor.hpp` / `M2006.cpp` / 影子初值三处；
+  `CONTROL_TUNE_LIVE` 已置 **0**（影子变量、抄写/回读代码、`RefCurve` 全部退出编译，固件回到"纯框架"形态）。
+- **用不上的页面**（PnX 框架专有，本工程无对应符号/目录，报错属正常）：`can_diag_bus` CAN 诊断、
+  "固件日志"（PnX 定长 RAM logger）、按 `configs/boards/<board>/params.json` 的图形配置。
+- **两条纪律**：① **每次重编后必须重新连接**（变量地址会变，否则采样/写入打偏）；
+  ② README 明确"**断开探针不等于电机停机**"，手边留硬件断电开关。
+- **打开工程的坑**：仓库根有 CubeMX 早期遗留的 `CMakeLists.txt` / `CMakePresets.json` / `.ld`，
+  自动识别可能给出多个 ELF 候选 → 手动指定 `board/build/Debug/board.elf`、芯片 `STM32F407IGHx`，
+  并关闭"调试与烧录前构建"（沿用 `ninja -C board/build/Debug` 的产物）。
 
 **待做 · C · BMI088（无需任何外部硬件，板载即可验 —— 这是 C 比 B 好做的地方）**
 
@@ -397,22 +555,36 @@ board/(CubeMX 生成)  ←  bsp/  ←  modules/  ←  threads/
 - [x] D · **加热极性**：`GPIOF->IDR` bit6 在 `duty=1` 时为 1、`duty=0` 时为 0 → **MCU 侧极性正常（高=加热）**
 - [x] D · **闭环算得对**：`TempPid.ref=40.0` / `fdb=26.25` / `result=1.375` → 夹紧后 `CCR1=1000`；`self_test` 全 0
 - [x] D · **不加热分支**：把 `INIT_ERR` 置 1 → `CCR1=0`、`TEMP_CTRL_ERR=1`
-- [ ] D · **⚠ 温度真的升上去**（**当前阻塞：怀疑板子没接主电源**）—— duty=1 连续 37 s 温度无变化、
-      duty=0 保持 25 s 也无变化，只在 26.25/26.5 ℃ 量化抖动。极性已排除 → 优先查加热 rail 供电
-      （板子是否接了电池/DC？万用表量加热电阻供电端与 PF6）。接上主电源后用同一份固件复测即可
-- [ ] D · **温控闭环指标**：目标温度阶跃后温度收敛、无持续振荡；目标低于当前温度时 duty 归 0（**duty 归 0 已验**，升温段待供电）
+- [x] D · **⚠ 温度真的升上去 —— 2026-10-15 晚接主电源后复测：通过 ✅**
+      同一份固件（`TEMP_CTRL_ENABLE=1`、目标 40 ℃）：接主电源前温度稳在 **27.375 ℃**（= 室温，加热 rail 无电），
+      接上电池后升到 **41~42 ℃**。→ **上次"duty=1 烤 37 s 不升温"的根因就是板子没接主电源**，非软件问题。
+      这条同时证明**板载电源轨正常**，为方向 B 扫清前置（CAN 收发器同吃这条轨）。
+      启动段也顺带印证了 P 增益口径：T=27.4 ⇒ duty = 0.1×12.6 = 1.26 → **夹到 1.0（满功率）**。
+- [x] D · **温控闭环指标 —— 2026-10-15 晚复测：通过 ✅**（同一份固件、两次上电）
+      - 第 1 次上电：没看到爬升过程，读到 41~42 ℃（= 满功率冲刺段的过冲峰值）；
+      - 第 2 次上电：**看到了完整爬升过程**，最终**稳定在 38.25 ℃**。
+      - **判读：38.25 ℃ 就是纯 P 的稳态静差，不是缺陷。** T=38.25 ⇒ duty = 0.1×(40−38.25) = **0.175**，
+        恰好等于维持该温度所需的热损功率占比 —— 比例控制必然有静差（要真正消掉需引入 I 项，
+        而本轮决定不动老师给的 `TempPid` 参数）。
+      - **可精确验证的预测**：`TIM10->CCR1` 应 ≈ **162~187**（duty 0.1625~0.1875 × (ARR+1)=1000；
+        温度在 38.125/38.25/38.375 之间按 0.125 ℃ 量化抖动）。若相符，则"温度解析 → PID → [0,1] 归一化 →
+        CCR 换算"整条链路同时被定量确认。
+      - 第 1 次上电观察到的 41~42 ℃ 与本次不矛盾：那正是"满功率冲上 40 后切断、热惯性再冲一点"的暂态。
 - [ ] D · **舵机（D3，选做）**：0°/90°/180° ↔ 500/1500/2500 µs（无舵机就读 CCR1 核对）
 
 **待做 · E · alive 线程与灯效（**板载即可自验，不需要任何外部硬件**）**
 
-- [ ] E · **alive 线程在跑**：`alive_thread.tx_thread_run_count` 1.5 s 内 +15（100 ms/轮）、`state=TX_SLEEP`；栈水位 < 512 B
-- [ ] E · **三个信号量已建**：`_tx_semaphore_created_count = 3`；逐个读 `init_ok_sem` / `imu_alive_sem` / `motor_alive_sem` 的 `count`
-- [ ] E · **初始化中**：上电后约 0~4.5 s（BMI088 初始化期间）应为 **绿慢闪**
-- [ ] E · **全部正常**：初始化完成且三路上报齐全 → **绿常亮**；SWD 读 `GPIOH->ODR` 应为 `0x800`（bit11=绿）
-- [ ] E · **初始化失败**：`alive` 里置 `ALIVE_INJECT_INIT_FAIL=1` 重编译 → 10 s 后转 **红常亮**（`ODR` bit12）
-- [ ] E · **IMU 线程死**：置 `ALIVE_INJECT_IMU_DEAD=1` → **蓝常亮**（`ODR` bit10）
-- [ ] E · **control 线程死**：置 `ALIVE_INJECT_MOTOR_DEAD=1` → **红蓝交替**（1 Hz）
-- [ ] E · **恢复**：三个注入开关都置回 0 后灯回到绿常亮（排除"一直红/一直蓝"的伪现象）
+- [x] E · **alive 线程在跑**（2026-10-15 晚）：`alive_thread.tx_thread_run_count` 1.5 s 内 **+15** 已确认
+      （栈水位未单独测，后续可补）
+- [x] E · **三个信号量已建**（2026-10-15 晚）：`_tx_semaphore_created_count = 3` 已确认
+- [x] E · **初始化中**（2026-10-15 晚补验）：上电后约 0~4.5 s（BMI088 初始化期间）**绿慢闪** ✓
+- [x] E · **全部正常**（2026-10-15 晚）：初始化完成后 **绿常亮**；SWD 读 `GPIOH->ODR` = `0x800` ✓
+      （Live Watch 里显示十进制 **2048** = 0x800，等价；bit11 = 绿）
+- [x] E · **初始化失败**（2026-10-15 晚）：注入固件 `e1_init_fail.elf` → 绿慢闪**撑满 10 s** 后转 **红常亮**（`ODR` bit12）✓
+- [x] E · **IMU 线程死**（同晚）：`e2_imu_dead.elf` → **蓝常亮**（`ODR` bit10）✓
+- [x] E · **control 线程死**（同晚）：`e3_motor_dead.elf` → **红蓝交替**（1 Hz）✓
+- [x] E · **恢复**（同晚）：烧回 `e4_normal.elf`（三开关全 0）→ **绿慢闪 → 绿常亮** ✓
+      （**四条故障/暂态灯效全部实机确认**，排除"一直红/一直蓝"的伪现象）
 - [ ] E（可选，端到端）：把 `imuthread.cpp` / `controlthread.cpp` 里的 `Alive_Notify*` 注释掉，效果应与注入开关一致
 - 备注：C 的"短接 MISO 复现 `ACC_DATA_ERR`"改用 SWD 读 `g_imu.self_test` 观察 —— 蓝灯已改表示"imu 线程死"，
   不再兼职显示 IMU 数据错误（旧行为只在方向 E 之前临时存在）。
